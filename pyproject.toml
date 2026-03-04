@@ -18,6 +18,7 @@ teia = [
 ]
 ceo = [
   "mlx-audio>=0.3.1",
+  "webrtcvad>=2.0.10",
 ]
 crio = [
   "torch>=2.3.0",
