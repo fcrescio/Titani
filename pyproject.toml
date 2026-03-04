@@ -1,0 +1,40 @@
+[project]
+name = "titani"
+version = "0.1.0"
+description = "Titan consumers for Ermete/Iris"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "aiortc>=1.9.0",
+  "httpx>=0.27.0",
+  "numpy>=1.26.0",
+  "pillow>=10.4.0",
+  "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+teia = [
+  "openai>=1.40.0",
+]
+ceo = [
+  "mlx-audio>=0.1.0",
+]
+crio = [
+  "torch>=2.3.0",
+  "torchaudio>=2.3.0",
+]
+
+[project.scripts]
+teia = "titani.teia:main"
+ceo = "titani.ceo:main"
+crio = "titani.crio:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
