@@ -25,6 +25,7 @@ MAX_CONTEXT_SECONDS = 8
 MAX_CONTEXT_SAMPLES = TARGET_SAMPLE_RATE * MAX_CONTEXT_SECONDS
 WEBRTC_CHUNK_MS = 30
 WEBRTC_CHUNK_SAMPLES = TARGET_SAMPLE_RATE * WEBRTC_CHUNK_MS // 1000
+DEFAULT_WEBRTC_SAMPLE_RATE = 48_000
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -262,32 +263,61 @@ class AsrPipeline:
         return str(getattr(result, "text", "")).strip()
 
 
+def _resample_pcm16(audio_pcm16: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    if audio_pcm16.size == 0 or src_rate <= 0 or dst_rate <= 0 or src_rate == dst_rate:
+        return np.ascontiguousarray(audio_pcm16, dtype=np.int16)
+
+    src = audio_pcm16.astype(np.float32)
+    src_len = src.size
+    dst_len = max(1, int(round(src_len * dst_rate / src_rate)))
+    src_x = np.linspace(0.0, 1.0, num=src_len, endpoint=False)
+    dst_x = np.linspace(0.0, 1.0, num=dst_len, endpoint=False)
+    dst = np.interp(dst_x, src_x, src)
+    return np.ascontiguousarray(np.clip(dst, -32768, 32767).astype(np.int16))
+
+
 class TtsOutboundAudioTrack(MediaStreamTrack):
     kind = "audio"
 
     def __init__(self):
         super().__init__()
         self._queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=256)
+        self._sample_rate = DEFAULT_WEBRTC_SAMPLE_RATE
+        self._chunk_samples = max(1, self._sample_rate * WEBRTC_CHUNK_MS // 1000)
         self._pts = 0
+
+    def set_output_sample_rate(self, sample_rate: int) -> None:
+        if sample_rate <= 0 or sample_rate == self._sample_rate:
+            return
+
+        self._sample_rate = sample_rate
+        self._chunk_samples = max(1, self._sample_rate * WEBRTC_CHUNK_MS // 1000)
+        self._pts = 0
+        print(f"[ceo] outbound sample rate aggiornato a {self._sample_rate}Hz")
+
+    @property
+    def output_sample_rate(self) -> int:
+        return self._sample_rate
 
     async def recv(self) -> AudioFrame:
         pcm16 = await self._queue.get()
         frame = AudioFrame.from_ndarray(pcm16.reshape(1, -1), format="s16", layout="mono")
-        frame.sample_rate = TARGET_SAMPLE_RATE
-        frame.time_base = Fraction(1, TARGET_SAMPLE_RATE)
+        frame.sample_rate = self._sample_rate
+        frame.time_base = Fraction(1, self._sample_rate)
         frame.pts = self._pts
         self._pts += pcm16.size
         return frame
 
-    async def push_pcm16(self, audio_pcm16: np.ndarray) -> None:
+    async def push_pcm16(self, audio_pcm16: np.ndarray, sample_rate: int) -> None:
         if audio_pcm16.size == 0:
             return
 
-        chunk = WEBRTC_CHUNK_SAMPLES
-        for start in range(0, audio_pcm16.size, chunk):
-            pcm = np.ascontiguousarray(audio_pcm16[start : start + chunk], dtype=np.int16)
-            if pcm.size < chunk:
-                pcm = np.pad(pcm, (0, chunk - pcm.size))
+        adapted = _resample_pcm16(audio_pcm16, sample_rate, self._sample_rate)
+
+        for start in range(0, adapted.size, self._chunk_samples):
+            pcm = np.ascontiguousarray(adapted[start : start + self._chunk_samples], dtype=np.int16)
+            if pcm.size < self._chunk_samples:
+                pcm = np.pad(pcm, (0, self._chunk_samples - pcm.size))
             if self._queue.full():
                 try:
                     _ = self._queue.get_nowait()
@@ -317,7 +347,8 @@ class TtsPipeline:
             if audio.size == 0:
                 continue
             clipped = np.clip(audio, -1.0, 1.0)
-            yield (clipped * 32767.0).astype(np.int16)
+            sample_rate = int(getattr(result, "sample_rate", TARGET_SAMPLE_RATE))
+            yield (clipped * 32767.0).astype(np.int16), sample_rate
 
 
 async def ceo_consumer(cfg: CeoConfig) -> None:
@@ -336,17 +367,23 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
             return
 
         print(f"[ceo] say_to_user ricevuto -> {text!r}")
-        audio_chunks = await asyncio.to_thread(lambda: list(tts_pipeline.stream_voice_design_pcm16(text)))
-        if not audio_chunks:
+        chunk_data = await asyncio.to_thread(lambda: list(tts_pipeline.stream_voice_design_pcm16(text)))
+        if not chunk_data:
             print("[ceo] TTS non ha generato audio")
             return
 
-        full_audio = np.concatenate(audio_chunks)
+        chunk_audio = [item[0] for item in chunk_data]
+        tts_sample_rate = chunk_data[0][1]
+        full_audio = np.concatenate(chunk_audio)
         if debug.enabled:
-            debug.save_tts_wav(full_audio)
+            debug.save_tts_wav(full_audio, sample_rate=tts_sample_rate)
 
-        await outbound_track.push_pcm16(full_audio)
-        print(f"[ceo] TTS inviato su WebRTC ({full_audio.size / TARGET_SAMPLE_RATE:.2f}s)")
+        await outbound_track.push_pcm16(full_audio, sample_rate=tts_sample_rate)
+        print(
+            "[ceo] TTS inviato su WebRTC "
+            f"({full_audio.size / max(1, tts_sample_rate):.2f}s, src_sr={tts_sample_rate}Hz, "
+            f"dst_sr={outbound_track.output_sample_rate}Hz)"
+        )
 
     @pc.on("track")
     async def on_track(track: MediaStreamTrack):
@@ -356,6 +393,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
         async def pump() -> None:
             while True:
                 frame = await track.recv()
+                outbound_track.set_output_sample_rate(int(frame.sample_rate or DEFAULT_WEBRTC_SAMPLE_RATE))
                 completed_audio = turn_pipeline.process(frame)
                 if completed_audio is not None:
                     debug.save_segment_for_asr(completed_audio)
