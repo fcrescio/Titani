@@ -10,6 +10,7 @@ from tempfile import NamedTemporaryFile
 import numpy as np
 import webrtcvad
 import websockets
+from av.audio.resampler import AudioResampler
 from aiortc import MediaStreamTrack, RTCPeerConnection
 from aiortc.mediastreams import AudioFrame
 from mlx_audio.stt.utils import load_model as load_stt
@@ -127,30 +128,21 @@ class SmartTurnPipeline:
         self._in_user_turn = False
         self._last_speech_ms = 0.0
         self._checked_during_current_silence = False
+        self._audio_resampler = AudioResampler(format="s16", layout="mono", rate=TARGET_SAMPLE_RATE)
         print("[ceo] Smart Turn v3 attivo (mlx-community/smart-turn-v3)")
 
-    def _frame_to_mono(self, frame: AudioFrame) -> np.ndarray:
-        pcm = frame.to_ndarray()
-        mono = pcm.mean(axis=0) if pcm.ndim == 2 else pcm
-        mono = mono.astype(np.float32)
-        if np.max(np.abs(mono), initial=0.0) > 1.5:
-            mono = mono / 32768.0
-        return mono
-
-    def _resample_to_16k(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if sample_rate == TARGET_SAMPLE_RATE:
-            return audio
-        if sample_rate <= 0 or audio.size == 0:
+    def _frame_to_mono_16k(self, frame: AudioFrame) -> np.ndarray:
+        resampled_frames = self._audio_resampler.resample(frame)
+        if not resampled_frames:
             return np.zeros(0, dtype=np.float32)
 
-        duration_s = audio.size / sample_rate
-        target_size = int(round(duration_s * TARGET_SAMPLE_RATE))
-        if target_size <= 0:
-            return np.zeros(0, dtype=np.float32)
+        chunks: list[np.ndarray] = []
+        for resampled in resampled_frames:
+            pcm = resampled.to_ndarray()
+            mono = pcm.reshape(-1) if pcm.ndim > 1 else pcm
+            chunks.append(mono.astype(np.float32, copy=False) / 32768.0)
 
-        src_x = np.linspace(0.0, duration_s, num=audio.size, endpoint=False)
-        dst_x = np.linspace(0.0, duration_s, num=target_size, endpoint=False)
-        return np.interp(dst_x, src_x, audio).astype(np.float32)
+        return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
     def _is_speech(self, frame_16k: np.ndarray) -> bool:
         if frame_16k.size < WEBRTC_CHUNK_SAMPLES:
@@ -170,7 +162,7 @@ class SmartTurnPipeline:
         return False
 
     def process(self, frame: AudioFrame) -> np.ndarray | None:
-        frame_16k = self._resample_to_16k(self._frame_to_mono(frame), frame.sample_rate)
+        frame_16k = self._frame_to_mono_16k(frame)
         if self._debug is not None:
             self._debug.observe_frame(frame.sample_rate, frame_16k)
         if frame_16k.size:
