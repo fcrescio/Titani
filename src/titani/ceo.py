@@ -1,4 +1,5 @@
 import asyncio
+from fractions import Fraction
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ from av.audio.resampler import AudioResampler
 from aiortc import MediaStreamTrack, RTCPeerConnection
 from aiortc.mediastreams import AudioFrame
 from mlx_audio.stt.utils import load_model as load_stt
+from mlx_audio.tts.utils import load_model as load_tts
 from mlx_audio.vad.utils import load_model as load_vad
 
 from titani.common import ErmeteConfig, iter_ws_json, maybe_handle_offer, run
@@ -23,6 +25,7 @@ MAX_CONTEXT_SECONDS = 8
 MAX_CONTEXT_SAMPLES = TARGET_SAMPLE_RATE * MAX_CONTEXT_SECONDS
 WEBRTC_CHUNK_MS = 30
 WEBRTC_CHUNK_SAMPLES = TARGET_SAMPLE_RATE * WEBRTC_CHUNK_MS // 1000
+DEFAULT_WEBRTC_SAMPLE_RATE = 48_000
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -41,6 +44,16 @@ class CeoConfig(ErmeteConfig):
     debug_mode: bool = _env_bool("CEO_DEBUG_MODE", False)
     debug_out_dir: str = os.getenv("CEO_DEBUG_OUT_DIR", "./ceo_debug")
     debug_heartbeat_ms: int = int(os.getenv("CEO_DEBUG_HEARTBEAT_MS", "2000"))
+    tts_model: str = os.getenv(
+        "CEO_TTS_MODEL",
+        "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
+    )
+    tts_language: str = os.getenv("CEO_TTS_LANGUAGE", "Italian")
+    tts_instruct: str = os.getenv(
+        "CEO_TTS_INSTRUCT",
+        "Una voce femminile adulta, calda e naturale, con tono colloquiale e ritmo medio.",
+    )
+    tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.32"))
 
 
 class CeoDebug:
@@ -112,6 +125,20 @@ class CeoDebug:
 
         duration = (audio_16k.size / TARGET_SAMPLE_RATE) if audio_16k.size else 0.0
         print(f"[ceo][debug] salvato segmento ASR: {out_path} ({duration:.2f}s)")
+        return out_path
+
+    def save_tts_wav(self, pcm16_audio: np.ndarray, sample_rate: int = TARGET_SAMPLE_RATE) -> Path | None:
+        if not self._enabled:
+            return None
+
+        self._saved_segments += 1
+        out_path = self._out_dir / f"tts_{self._saved_segments:04d}_{int(time.time() * 1000)}.wav"
+        with wave.open(str(out_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm16_audio.astype(np.int16, copy=False).tobytes())
+        print(f"[ceo][debug] salvato TTS wav: {out_path}")
         return out_path
 
 
@@ -236,12 +263,127 @@ class AsrPipeline:
         return str(getattr(result, "text", "")).strip()
 
 
+def _resample_pcm16(audio_pcm16: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    if audio_pcm16.size == 0 or src_rate <= 0 or dst_rate <= 0 or src_rate == dst_rate:
+        return np.ascontiguousarray(audio_pcm16, dtype=np.int16)
+
+    src = audio_pcm16.astype(np.float32)
+    src_len = src.size
+    dst_len = max(1, int(round(src_len * dst_rate / src_rate)))
+    src_x = np.linspace(0.0, 1.0, num=src_len, endpoint=False)
+    dst_x = np.linspace(0.0, 1.0, num=dst_len, endpoint=False)
+    dst = np.interp(dst_x, src_x, src)
+    return np.ascontiguousarray(np.clip(dst, -32768, 32767).astype(np.int16))
+
+
+class TtsOutboundAudioTrack(MediaStreamTrack):
+    kind = "audio"
+
+    def __init__(self):
+        super().__init__()
+        self._queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=256)
+        self._sample_rate = DEFAULT_WEBRTC_SAMPLE_RATE
+        self._chunk_samples = max(1, self._sample_rate * WEBRTC_CHUNK_MS // 1000)
+        self._pts = 0
+
+    def set_output_sample_rate(self, sample_rate: int) -> None:
+        if sample_rate <= 0 or sample_rate == self._sample_rate:
+            return
+
+        self._sample_rate = sample_rate
+        self._chunk_samples = max(1, self._sample_rate * WEBRTC_CHUNK_MS // 1000)
+        self._pts = 0
+        print(f"[ceo] outbound sample rate aggiornato a {self._sample_rate}Hz")
+
+    @property
+    def output_sample_rate(self) -> int:
+        return self._sample_rate
+
+    async def recv(self) -> AudioFrame:
+        pcm16 = await self._queue.get()
+        frame = AudioFrame.from_ndarray(pcm16.reshape(1, -1), format="s16", layout="mono")
+        frame.sample_rate = self._sample_rate
+        frame.time_base = Fraction(1, self._sample_rate)
+        frame.pts = self._pts
+        self._pts += pcm16.size
+        return frame
+
+    async def push_pcm16(self, audio_pcm16: np.ndarray, sample_rate: int) -> None:
+        if audio_pcm16.size == 0:
+            return
+
+        adapted = _resample_pcm16(audio_pcm16, sample_rate, self._sample_rate)
+
+        for start in range(0, adapted.size, self._chunk_samples):
+            pcm = np.ascontiguousarray(adapted[start : start + self._chunk_samples], dtype=np.int16)
+            if pcm.size < self._chunk_samples:
+                pcm = np.pad(pcm, (0, self._chunk_samples - pcm.size))
+            if self._queue.full():
+                try:
+                    _ = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            await self._queue.put(pcm)
+
+
+class TtsPipeline:
+    def __init__(self, cfg: CeoConfig):
+        self._cfg = cfg
+        self._model = load_tts(cfg.tts_model)
+        print(f"[ceo] TTS attivo ({cfg.tts_model}, language={cfg.tts_language})")
+
+    def stream_voice_design_pcm16(self, text: str):
+        if not text.strip():
+            return
+
+        for result in self._model.generate_voice_design(
+            text=text,
+            language=self._cfg.tts_language,
+            instruct=self._cfg.tts_instruct,
+            stream=True,
+            streaming_interval=self._cfg.tts_streaming_interval,
+        ):
+            audio = np.asarray(result.audio, dtype=np.float32)
+            if audio.size == 0:
+                continue
+            clipped = np.clip(audio, -1.0, 1.0)
+            sample_rate = int(getattr(result, "sample_rate", TARGET_SAMPLE_RATE))
+            yield (clipped * 32767.0).astype(np.int16), sample_rate
+
+
 async def ceo_consumer(cfg: CeoConfig) -> None:
     pc = RTCPeerConnection()
     debug = CeoDebug(cfg)
     turn_pipeline = SmartTurnPipeline(cfg, debug=debug)
     asr_pipeline = AsrPipeline(cfg)
+    tts_pipeline = TtsPipeline(cfg)
+    outbound_track = TtsOutboundAudioTrack()
+    pc.addTrack(outbound_track)
     ws_send_lock = asyncio.Lock()
+
+    async def handle_say_to_user(payload: dict) -> None:
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            return
+
+        print(f"[ceo] say_to_user ricevuto -> {text!r}")
+        chunk_data = await asyncio.to_thread(lambda: list(tts_pipeline.stream_voice_design_pcm16(text)))
+        if not chunk_data:
+            print("[ceo] TTS non ha generato audio")
+            return
+
+        chunk_audio = [item[0] for item in chunk_data]
+        tts_sample_rate = chunk_data[0][1]
+        full_audio = np.concatenate(chunk_audio)
+        if debug.enabled:
+            debug.save_tts_wav(full_audio, sample_rate=tts_sample_rate)
+
+        await outbound_track.push_pcm16(full_audio, sample_rate=tts_sample_rate)
+        print(
+            "[ceo] TTS inviato su WebRTC "
+            f"({full_audio.size / max(1, tts_sample_rate):.2f}s, src_sr={tts_sample_rate}Hz, "
+            f"dst_sr={outbound_track.output_sample_rate}Hz)"
+        )
 
     @pc.on("track")
     async def on_track(track: MediaStreamTrack):
@@ -251,6 +393,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
         async def pump() -> None:
             while True:
                 frame = await track.recv()
+                outbound_track.set_output_sample_rate(int(frame.sample_rate or DEFAULT_WEBRTC_SAMPLE_RATE))
                 completed_audio = turn_pipeline.process(frame)
                 if completed_audio is not None:
                     debug.save_segment_for_asr(completed_audio)
@@ -275,6 +418,8 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
             if t == "ping":
                 async with ws_send_lock:
                     await ws.send(json.dumps({"type": "pong"}))
+            elif t == "say_to_user" and data.get("producer") == "teia":
+                asyncio.create_task(handle_say_to_user(data))
             else:
                 print(f"[ws] msg: {data}")
 
