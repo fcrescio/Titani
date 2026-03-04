@@ -1,6 +1,5 @@
 import asyncio
 from fractions import Fraction
-import json
 import os
 from pathlib import Path
 import time
@@ -18,7 +17,7 @@ from mlx_audio.stt.utils import load_model as load_stt
 from mlx_audio.tts.utils import load_model as load_tts
 from mlx_audio.vad.utils import load_model as load_vad
 
-from titani.common import ErmeteConfig, iter_ws_json, maybe_handle_offer, run
+from titani.common import ErmeteConfig, WebRTCCommandChannel, maybe_handle_offer, run
 
 TARGET_SAMPLE_RATE = 16_000
 MAX_CONTEXT_SECONDS = 8
@@ -353,13 +352,14 @@ class TtsPipeline:
 
 async def ceo_consumer(cfg: CeoConfig) -> None:
     pc = RTCPeerConnection()
+    cmd_channel = WebRTCCommandChannel(pc)
     debug = CeoDebug(cfg)
     turn_pipeline = SmartTurnPipeline(cfg, debug=debug)
     asr_pipeline = AsrPipeline(cfg)
     tts_pipeline = TtsPipeline(cfg)
     outbound_track = TtsOutboundAudioTrack()
     pc.addTrack(outbound_track)
-    ws_send_lock = asyncio.Lock()
+    cmd_send_lock = asyncio.Lock()
 
     async def handle_say_to_user(payload: dict) -> None:
         text = str(payload.get("text", "")).strip()
@@ -405,23 +405,27 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                         "transcript": transcript,
                         "asr_model": cfg.asr_model,
                     }
-                    async with ws_send_lock:
-                        await ws.send(json.dumps(message))
+                    async with cmd_send_lock:
+                        await cmd_channel.send_json(message)
                     print(f"[ceo] turn-end -> {message}")
 
         asyncio.create_task(pump())
 
     async with websockets.connect(cfg.ermete_ws, additional_headers=cfg.auth_headers()) as ws:
         await maybe_handle_offer(ws, pc)
-        async for data in iter_ws_json(ws):
-            t = data.get("type")
-            if t == "ping":
-                async with ws_send_lock:
-                    await ws.send(json.dumps({"type": "pong"}))
-            elif t == "say_to_user" and data.get("producer") == "teia":
-                asyncio.create_task(handle_say_to_user(data))
-            else:
-                print(f"[ws] msg: {data}")
+
+        async def consume_cmd_messages() -> None:
+            async for data in cmd_channel.iter_json():
+                t = data.get("type")
+                if t == "ping":
+                    async with cmd_send_lock:
+                        await cmd_channel.send_json({"type": "pong"})
+                elif t == "say_to_user" and data.get("producer") == "teia":
+                    asyncio.create_task(handle_say_to_user(data))
+                else:
+                    print(f"[dc] msg: {data}")
+
+        await consume_cmd_messages()
 
 
 def main() -> None:
