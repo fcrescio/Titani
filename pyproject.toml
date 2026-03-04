@@ -18,7 +18,7 @@ teia = [
 ]
 ceo = [
   "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@0547bec",
-  "webrtcvad-wheels>=2.0.14",
+  "silero-vad>=5.1.2",
 ]
 crio = [
   "torch>=2.3.0",
