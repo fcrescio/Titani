@@ -421,8 +421,12 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                         "transcript": transcript,
                         "asr_model": cfg.asr_model,
                     }
-                    async with cmd_send_lock:
-                        await cmd_channel.send_json(message)
+                    try:
+                        async with cmd_send_lock:
+                            await cmd_channel.send_json(message)
+                    except Exception:
+                        logger.exception("[ceo] invio speaker_turn_completed fallito")
+                        continue
                     logger.info("[ceo] turn-end -> %s", message)
 
         asyncio.create_task(pump())
