@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.rtcdatachannel import RTCDataChannel
 
 
 @dataclass(slots=True)
@@ -77,3 +78,62 @@ async def iter_ws_json(ws: websockets.WebSocketClientProtocol):
 
 def run(coro):
     asyncio.run(coro)
+
+
+class WebRTCCommandChannel:
+    """Gestisce il data channel WebRTC `cmd` per messaggi JSON applicativi."""
+
+    def __init__(self, pc: RTCPeerConnection, label: str = "cmd"):
+        self._label = label
+        self._channel: RTCDataChannel | None = None
+        self._open_event = asyncio.Event()
+        self._incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        @pc.on("datachannel")
+        def on_datachannel(channel: RTCDataChannel) -> None:
+            if channel.label != self._label:
+                return
+            self._attach(channel)
+
+    def _attach(self, channel: RTCDataChannel) -> None:
+        self._channel = channel
+
+        @channel.on("open")
+        def _on_open() -> None:
+            print(f"[webrtc] data channel aperto: {channel.label}")
+            self._open_event.set()
+
+        @channel.on("close")
+        def _on_close() -> None:
+            print(f"[webrtc] data channel chiuso: {channel.label}")
+            self._open_event.clear()
+
+        @channel.on("message")
+        def _on_message(message: str | bytes) -> None:
+            payload: Any
+            if isinstance(message, bytes):
+                try:
+                    payload = json.loads(message.decode("utf-8"))
+                except Exception:
+                    return
+            else:
+                try:
+                    payload = json.loads(message)
+                except Exception:
+                    return
+
+            if isinstance(payload, dict):
+                self._incoming.put_nowait(payload)
+
+        if channel.readyState == "open":
+            self._open_event.set()
+
+    async def send_json(self, payload: dict[str, Any], timeout_s: float = 10.0) -> None:
+        await asyncio.wait_for(self._open_event.wait(), timeout=timeout_s)
+        if self._channel is None or self._channel.readyState != "open":
+            raise RuntimeError("data channel cmd non disponibile")
+        self._channel.send(json.dumps(payload))
+
+    async def iter_json(self):
+        while True:
+            yield await self._incoming.get()

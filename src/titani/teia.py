@@ -1,5 +1,4 @@
 import base64
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,7 +7,7 @@ import httpx
 import websockets
 from aiortc import RTCPeerConnection
 
-from titani.common import ErmeteConfig, download_frame, iter_ws_json, maybe_handle_offer, run
+from titani.common import ErmeteConfig, WebRTCCommandChannel, download_frame, maybe_handle_offer, run
 
 
 @dataclass(slots=True)
@@ -47,14 +46,16 @@ async def describe_snapshot(http: httpx.AsyncClient, cfg: TeiaConfig, image_path
 
 async def teia_consumer(cfg: TeiaConfig) -> None:
     pc = RTCPeerConnection()
+    cmd_channel = WebRTCCommandChannel(pc)
 
     async with httpx.AsyncClient() as http:
         async with websockets.connect(cfg.ermete_ws, additional_headers=cfg.auth_headers()) as ws:
             await maybe_handle_offer(ws, pc)
-            async for data in iter_ws_json(ws):
+
+            async for data in cmd_channel.iter_json():
                 t = data.get("type")
                 if t == "ping":
-                    await ws.send(json.dumps({"type": "pong"}))
+                    await cmd_channel.send_json({"type": "pong"})
                 elif t == "frame_available":
                     out_path = await download_frame(http, cfg, data)
                     description = await describe_snapshot(http, cfg, out_path)
@@ -65,10 +66,10 @@ async def teia_consumer(cfg: TeiaConfig) -> None:
                         "file_name": data.get("file_name"),
                         "description": description,
                     }
-                    await ws.send(json.dumps(message))
+                    await cmd_channel.send_json(message)
                     print(f"[teia] {message}")
                 else:
-                    print(f"[ws] msg: {data}")
+                    print(f"[dc] msg: {data}")
 
 
 def main() -> None:

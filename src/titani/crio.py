@@ -1,12 +1,11 @@
 import asyncio
-import json
 from dataclasses import dataclass
 
 import websockets
 from aiortc import MediaStreamTrack, RTCPeerConnection
 from aiortc.mediastreams import AudioFrame
 
-from titani.common import ErmeteConfig, iter_ws_json, maybe_handle_offer, run
+from titani.common import ErmeteConfig, WebRTCCommandChannel, maybe_handle_offer, run
 
 
 @dataclass(slots=True)
@@ -35,6 +34,7 @@ class LoopbackAudioTrack(MediaStreamTrack):
 
 async def crio_consumer(cfg: CrioConfig) -> None:
     pc = RTCPeerConnection()
+    cmd_channel = WebRTCCommandChannel(pc)
     loop_track = LoopbackAudioTrack()
     pc.addTrack(loop_track)
 
@@ -52,12 +52,12 @@ async def crio_consumer(cfg: CrioConfig) -> None:
 
     async with websockets.connect(cfg.ermete_ws, additional_headers=cfg.auth_headers()) as ws:
         await maybe_handle_offer(ws, pc)
-        async for data in iter_ws_json(ws):
+        async for data in cmd_channel.iter_json():
             t = data.get("type")
             if t == "ping":
-                await ws.send(json.dumps({"type": "pong"}))
+                await cmd_channel.send_json({"type": "pong"})
             else:
-                print(f"[ws] msg: {data}")
+                print(f"[dc] msg: {data}")
 
 
 def main() -> None:
