@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from tempfile import NamedTemporaryFile
 
 import numpy as np
+import webrtcvad
 import websockets
 from av.audio.resampler import AudioResampler
 from aiortc import MediaStreamTrack, RTCPeerConnection
@@ -16,14 +17,14 @@ from aiortc.mediastreams import AudioFrame
 from mlx_audio.stt.utils import load_model as load_stt
 from mlx_audio.tts.utils import load_model as load_tts
 from mlx_audio.vad.utils import load_model as load_vad
-from silero_vad import load_silero_vad
 
 from titani.common import ErmeteConfig, WebRTCCommandChannel, maybe_handle_offer, run, setup_logging
 
 TARGET_SAMPLE_RATE = 16_000
 MAX_CONTEXT_SECONDS = 8
 MAX_CONTEXT_SAMPLES = TARGET_SAMPLE_RATE * MAX_CONTEXT_SECONDS
-SILERO_WINDOW_SAMPLES = 512
+WEBRTC_CHUNK_MS = 10
+WEBRTC_CHUNK_SAMPLES = TARGET_SAMPLE_RATE * WEBRTC_CHUNK_MS // 1000
 DEFAULT_WEBRTC_SAMPLE_RATE = 48_000
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,6 @@ class CeoConfig(ErmeteConfig):
         "Una voce femminile adulta, calda e naturale, con tono colloquiale e ritmo medio.",
     )
     tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.32"))
-    silero_speech_threshold: float = float(os.getenv("CEO_SILERO_SPEECH_THRESHOLD", "0.5"))
 
 
 class CeoDebug:
@@ -152,8 +152,7 @@ class SmartTurnPipeline:
     def __init__(self, cfg: CeoConfig, debug: CeoDebug | None = None):
         self._cfg = cfg
         self._debug = debug
-        self._silero_model = load_silero_vad()
-        self._silero_buffer = np.zeros(0, dtype=np.float32)
+        self._vad = webrtcvad.Vad(2)
         self._model = load_vad("mlx-community/smart-turn-v3", strict=True)
         self._audio_context = np.zeros(0, dtype=np.float32)
         self._turn_audio_chunks: list[np.ndarray] = []
@@ -161,10 +160,7 @@ class SmartTurnPipeline:
         self._last_speech_ms = 0.0
         self._checked_during_current_silence = False
         self._audio_resampler = AudioResampler(format="s16", layout="mono", rate=TARGET_SAMPLE_RATE)
-        logger.info(
-            "[ceo] Smart Turn v3 attivo (mlx-community/smart-turn-v3) + Silero VAD (threshold=%.2f)",
-            self._cfg.silero_speech_threshold,
-        )
+        logger.info("[ceo] Smart Turn v3 attivo (mlx-community/smart-turn-v3)")
 
     def _frame_to_mono_16k(self, frame: AudioFrame) -> np.ndarray:
         resampled_frames = self._audio_resampler.resample(frame)
@@ -180,22 +176,21 @@ class SmartTurnPipeline:
         return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
     def _is_speech(self, frame_16k: np.ndarray) -> bool:
-        if frame_16k.size == 0:
+        if frame_16k.size < WEBRTC_CHUNK_SAMPLES:
             return False
 
-        self._silero_buffer = np.concatenate((self._silero_buffer, frame_16k))
-        if self._silero_buffer.size < SILERO_WINDOW_SAMPLES:
+        clipped = np.clip(frame_16k, -1.0, 1.0)
+        pcm16 = (clipped * 32767.0).astype(np.int16)
+
+        usable = (pcm16.size // WEBRTC_CHUNK_SAMPLES) * WEBRTC_CHUNK_SAMPLES
+        if usable == 0:
             return False
 
-        speaking = False
-        while self._silero_buffer.size >= SILERO_WINDOW_SAMPLES:
-            chunk = self._silero_buffer[:SILERO_WINDOW_SAMPLES]
-            self._silero_buffer = self._silero_buffer[SILERO_WINDOW_SAMPLES:]
-            speech_prob = float(self._silero_model(chunk, TARGET_SAMPLE_RATE).item())
-            if speech_prob >= self._cfg.silero_speech_threshold:
-                speaking = True
-
-        return speaking
+        for start in range(0, usable, WEBRTC_CHUNK_SAMPLES):
+            chunk = pcm16[start : start + WEBRTC_CHUNK_SAMPLES]
+            if self._vad.is_speech(chunk.tobytes(), TARGET_SAMPLE_RATE):
+                return True
+        return False
 
     def process(self, frame: AudioFrame) -> np.ndarray | None:
         frame_16k = self._frame_to_mono_16k(frame)
@@ -239,8 +234,6 @@ class SmartTurnPipeline:
             if prediction == 1:
                 self._in_user_turn = False
                 self._audio_context = np.zeros(0, dtype=np.float32)
-                self._silero_buffer = np.zeros(0, dtype=np.float32)
-                self._silero_model.reset_states()
                 completed_turn = (
                     np.concatenate(self._turn_audio_chunks)
                     if self._turn_audio_chunks
