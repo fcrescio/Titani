@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,7 +9,17 @@ import httpx
 import websockets
 from aiortc import RTCPeerConnection
 
-from titani.common import ErmeteConfig, WebRTCCommandChannel, download_frame, iter_ws_json, maybe_handle_offer, run
+from titani.common import (
+    ErmeteConfig,
+    WebRTCCommandChannel,
+    download_frame,
+    iter_ws_json,
+    maybe_handle_offer,
+    run,
+    setup_logging,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -49,7 +60,20 @@ async def teia_consumer(cfg: TeiaConfig) -> None:
     pc = RTCPeerConnection()
     cmd_channel = WebRTCCommandChannel(pc)
 
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange() -> None:
+        logger.info("[webrtc] connection state -> %s", pc.connectionState)
+
+    @pc.on("iceconnectionstatechange")
+    async def on_iceconnectionstatechange() -> None:
+        logger.info("[webrtc] ice connection state -> %s", pc.iceConnectionState)
+
+    @pc.on("track")
+    async def on_track(track) -> None:
+        logger.info("[webrtc] traccia in ingresso aperta: kind=%s id=%s", track.kind, getattr(track, "id", "-"))
+
     async with httpx.AsyncClient() as http:
+        logger.info("[teia] connessione websocket verso backend: %s", cfg.ermete_ws)
         async with websockets.connect(cfg.ermete_ws, additional_headers=cfg.auth_headers()) as ws:
             await maybe_handle_offer(ws, pc)
 
@@ -59,12 +83,12 @@ async def teia_consumer(cfg: TeiaConfig) -> None:
                     if t == "ping":
                         await cmd_channel.send_json({"type": "pong"})
                     else:
-                        print(f"[dc] msg: {data}")
+                        logger.info("[dc] msg: %s", data)
 
             async def consume_websocket() -> None:
                 async for data in iter_ws_json(ws):
                     if data.get("type") != "frame_available":
-                        print(f"[ws] msg: {data}")
+                        logger.info("[ws] msg: %s", data)
                         continue
 
                     out_path = await download_frame(http, cfg, data)
@@ -77,14 +101,15 @@ async def teia_consumer(cfg: TeiaConfig) -> None:
                         "description": description,
                     }
                     await cmd_channel.send_json(message)
-                    print(f"[teia] {message}")
+                    logger.info("[teia] snapshot_description inviato: frame_id=%s", data.get("frame_id"))
 
             await asyncio.gather(consume_data_channel(), consume_websocket())
 
 
 def main() -> None:
+    setup_logging()
     cfg = TeiaConfig()
-    print(f"[teia] ERMETE_WS={cfg.ermete_ws}")
+    logger.info("[teia] ERMETE_WS=%s", cfg.ermete_ws)
     run(teia_consumer(cfg))
 
 

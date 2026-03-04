@@ -1,11 +1,14 @@
 import asyncio
+import logging
 from dataclasses import dataclass
 
 import websockets
 from aiortc import MediaStreamTrack, RTCPeerConnection
 from aiortc.mediastreams import AudioFrame
 
-from titani.common import ErmeteConfig, WebRTCCommandChannel, maybe_handle_offer, run
+from titani.common import ErmeteConfig, WebRTCCommandChannel, maybe_handle_offer, run, setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -37,9 +40,19 @@ async def crio_consumer(cfg: CrioConfig) -> None:
     cmd_channel = WebRTCCommandChannel(pc)
     loop_track = LoopbackAudioTrack()
     pc.addTrack(loop_track)
+    logger.info("[webrtc] traccia audio loopback locale aggiunta")
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange() -> None:
+        logger.info("[webrtc] connection state -> %s", pc.connectionState)
+
+    @pc.on("iceconnectionstatechange")
+    async def on_iceconnectionstatechange() -> None:
+        logger.info("[webrtc] ice connection state -> %s", pc.iceConnectionState)
 
     @pc.on("track")
     async def on_track(track: MediaStreamTrack):
+        logger.info("[webrtc] traccia in ingresso aperta: kind=%s id=%s", track.kind, getattr(track, "id", "-"))
         if track.kind != "audio":
             return
 
@@ -50,6 +63,7 @@ async def crio_consumer(cfg: CrioConfig) -> None:
 
         asyncio.create_task(pump())
 
+    logger.info("[crio] connessione websocket verso backend: %s", cfg.ermete_ws)
     async with websockets.connect(cfg.ermete_ws, additional_headers=cfg.auth_headers()) as ws:
         await maybe_handle_offer(ws, pc)
         async for data in cmd_channel.iter_json():
@@ -57,12 +71,13 @@ async def crio_consumer(cfg: CrioConfig) -> None:
             if t == "ping":
                 await cmd_channel.send_json({"type": "pong"})
             else:
-                print(f"[dc] msg: {data}")
+                logger.info("[dc] msg: %s", data)
 
 
 def main() -> None:
+    setup_logging()
     cfg = CrioConfig()
-    print(f"[crio] ERMETE_WS={cfg.ermete_ws}")
+    logger.info("[crio] ERMETE_WS=%s", cfg.ermete_ws)
     run(crio_consumer(cfg))
 
 
