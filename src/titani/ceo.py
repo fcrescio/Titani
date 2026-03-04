@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from fractions import Fraction
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ from mlx_audio.stt.utils import load_model as load_stt
 from mlx_audio.tts.utils import load_model as load_tts
 from mlx_audio.vad.utils import load_model as load_vad
 
-from titani.common import ErmeteConfig, WebRTCCommandChannel, maybe_handle_offer, run
+from titani.common import ErmeteConfig, WebRTCCommandChannel, maybe_handle_offer, run, setup_logging
 
 TARGET_SAMPLE_RATE = 16_000
 MAX_CONTEXT_SECONDS = 8
@@ -25,6 +26,8 @@ MAX_CONTEXT_SAMPLES = TARGET_SAMPLE_RATE * MAX_CONTEXT_SECONDS
 WEBRTC_CHUNK_MS = 10
 WEBRTC_CHUNK_SAMPLES = TARGET_SAMPLE_RATE * WEBRTC_CHUNK_MS // 1000
 DEFAULT_WEBRTC_SAMPLE_RATE = 48_000
+
+logger = logging.getLogger(__name__)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -67,7 +70,7 @@ class CeoDebug:
         self._saved_segments = 0
         if self._enabled:
             self._out_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[ceo][debug] modalità debug attiva, directory output: {self._out_dir.resolve()}")
+            logger.info("[ceo][debug] modalità debug attiva, directory output: %s", self._out_dir.resolve())
 
     @property
     def enabled(self) -> bool:
@@ -79,9 +82,10 @@ class CeoDebug:
 
         if input_sample_rate not in self._seen_sample_rates:
             self._seen_sample_rates.add(input_sample_rate)
-            print(
-                "[ceo][debug] nuovo sample rate in ingresso "
-                f"{input_sample_rate}Hz (target pipeline: {TARGET_SAMPLE_RATE}Hz)"
+            logger.info(
+                "[ceo][debug] nuovo sample rate in ingresso %sHz (target pipeline: %sHz)",
+                input_sample_rate,
+                TARGET_SAMPLE_RATE,
             )
 
         self._frame_count += 1
@@ -99,11 +103,12 @@ class CeoDebug:
             peak = 0.0
 
         buffered_seconds = self._received_samples_16k / TARGET_SAMPLE_RATE
-        print(
-            "[ceo][debug] heartbeat audio: "
-            f"frame={self._frame_count} "
-            f"buffered_16k={buffered_seconds:.2f}s "
-            f"rms={rms:.6f} peak={peak:.6f}"
+        logger.info(
+            "[ceo][debug] heartbeat audio: frame=%s buffered_16k=%.2fs rms=%.6f peak=%.6f",
+            self._frame_count,
+            buffered_seconds,
+            rms,
+            peak,
         )
 
     def save_segment_for_asr(self, audio_16k: np.ndarray) -> Path | None:
@@ -123,7 +128,7 @@ class CeoDebug:
             wf.writeframes(pcm16.tobytes())
 
         duration = (audio_16k.size / TARGET_SAMPLE_RATE) if audio_16k.size else 0.0
-        print(f"[ceo][debug] salvato segmento ASR: {out_path} ({duration:.2f}s)")
+        logger.info("[ceo][debug] salvato segmento ASR: %s (%.2fs)", out_path, duration)
         return out_path
 
     def save_tts_wav(self, pcm16_audio: np.ndarray, sample_rate: int = TARGET_SAMPLE_RATE) -> Path | None:
@@ -137,7 +142,7 @@ class CeoDebug:
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
             wf.writeframes(pcm16_audio.astype(np.int16, copy=False).tobytes())
-        print(f"[ceo][debug] salvato TTS wav: {out_path}")
+        logger.info("[ceo][debug] salvato TTS wav: %s", out_path)
         return out_path
 
 
@@ -155,7 +160,7 @@ class SmartTurnPipeline:
         self._last_speech_ms = 0.0
         self._checked_during_current_silence = False
         self._audio_resampler = AudioResampler(format="s16", layout="mono", rate=TARGET_SAMPLE_RATE)
-        print("[ceo] Smart Turn v3 attivo (mlx-community/smart-turn-v3)")
+        logger.info("[ceo] Smart Turn v3 attivo (mlx-community/smart-turn-v3)")
 
     def _frame_to_mono_16k(self, frame: AudioFrame) -> np.ndarray:
         resampled_frames = self._audio_resampler.resample(frame)
@@ -224,7 +229,7 @@ class SmartTurnPipeline:
 
             prediction = int(getattr(result, "prediction", 0))
             probability = float(getattr(result, "probability", 0.0))
-            print(f"[ceo] smart-turn prediction={prediction} probability={probability:.3f}")
+            logger.info("[ceo] smart-turn prediction=%s probability=%.3f", prediction, probability)
 
             if prediction == 1:
                 self._in_user_turn = False
@@ -244,7 +249,7 @@ class AsrPipeline:
     def __init__(self, cfg: CeoConfig):
         self._cfg = cfg
         self._model = load_stt(cfg.asr_model)
-        print(f"[ceo] ASR attivo ({cfg.asr_model}, language={cfg.asr_language})")
+        logger.info("[ceo] ASR attivo (%s, language=%s)", cfg.asr_model, cfg.asr_language)
 
     def transcribe(self, audio_16k: np.ndarray) -> str:
         if audio_16k.size == 0:
@@ -292,7 +297,7 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self._sample_rate = sample_rate
         self._chunk_samples = max(1, self._sample_rate * WEBRTC_CHUNK_MS // 1000)
         self._pts = 0
-        print(f"[ceo] outbound sample rate aggiornato a {self._sample_rate}Hz")
+        logger.info("[ceo] outbound sample rate aggiornato a %sHz", self._sample_rate)
 
     @property
     def output_sample_rate(self) -> int:
@@ -329,7 +334,7 @@ class TtsPipeline:
     def __init__(self, cfg: CeoConfig):
         self._cfg = cfg
         self._model = load_tts(cfg.tts_model)
-        print(f"[ceo] TTS attivo ({cfg.tts_model}, language={cfg.tts_language})")
+        logger.info("[ceo] TTS attivo (%s, language=%s)", cfg.tts_model, cfg.tts_language)
 
     def stream_voice_design_pcm16(self, text: str):
         if not text.strip():
@@ -359,17 +364,26 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     tts_pipeline = TtsPipeline(cfg)
     outbound_track = TtsOutboundAudioTrack()
     pc.addTrack(outbound_track)
+    logger.info("[webrtc] traccia audio outbound TTS aggiunta")
     cmd_send_lock = asyncio.Lock()
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange() -> None:
+        logger.info("[webrtc] connection state -> %s", pc.connectionState)
+
+    @pc.on("iceconnectionstatechange")
+    async def on_iceconnectionstatechange() -> None:
+        logger.info("[webrtc] ice connection state -> %s", pc.iceConnectionState)
 
     async def handle_say_to_user(payload: dict) -> None:
         text = str(payload.get("text", "")).strip()
         if not text:
             return
 
-        print(f"[ceo] say_to_user ricevuto -> {text!r}")
+        logger.info("[ceo] say_to_user ricevuto -> %r", text)
         chunk_data = await asyncio.to_thread(lambda: list(tts_pipeline.stream_voice_design_pcm16(text)))
         if not chunk_data:
-            print("[ceo] TTS non ha generato audio")
+            logger.warning("[ceo] TTS non ha generato audio")
             return
 
         chunk_audio = [item[0] for item in chunk_data]
@@ -379,14 +393,16 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
             debug.save_tts_wav(full_audio, sample_rate=tts_sample_rate)
 
         await outbound_track.push_pcm16(full_audio, sample_rate=tts_sample_rate)
-        print(
-            "[ceo] TTS inviato su WebRTC "
-            f"({full_audio.size / max(1, tts_sample_rate):.2f}s, src_sr={tts_sample_rate}Hz, "
-            f"dst_sr={outbound_track.output_sample_rate}Hz)"
+        logger.info(
+            "[ceo] TTS inviato su WebRTC (%.2fs, src_sr=%sHz, dst_sr=%sHz)",
+            full_audio.size / max(1, tts_sample_rate),
+            tts_sample_rate,
+            outbound_track.output_sample_rate,
         )
 
     @pc.on("track")
     async def on_track(track: MediaStreamTrack):
+        logger.info("[webrtc] traccia in ingresso aperta: kind=%s id=%s", track.kind, getattr(track, "id", "-"))
         if track.kind != "audio":
             return
 
@@ -407,10 +423,11 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                     }
                     async with cmd_send_lock:
                         await cmd_channel.send_json(message)
-                    print(f"[ceo] turn-end -> {message}")
+                    logger.info("[ceo] turn-end -> %s", message)
 
         asyncio.create_task(pump())
 
+    logger.info("[ceo] connessione websocket verso backend: %s", cfg.ermete_ws)
     async with websockets.connect(cfg.ermete_ws, additional_headers=cfg.auth_headers()) as ws:
         await maybe_handle_offer(ws, pc)
 
@@ -423,14 +440,15 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                 elif t == "say_to_user" and data.get("producer") == "teia":
                     asyncio.create_task(handle_say_to_user(data))
                 else:
-                    print(f"[dc] msg: {data}")
+                    logger.info("[dc] msg: %s", data)
 
         await consume_cmd_messages()
 
 
 def main() -> None:
+    setup_logging()
     cfg = CeoConfig()
-    print(f"[ceo] ERMETE_WS={cfg.ermete_ws}")
+    logger.info("[ceo] ERMETE_WS=%s", cfg.ermete_ws)
     run(ceo_consumer(cfg))
 
 

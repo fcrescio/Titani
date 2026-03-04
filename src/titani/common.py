@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -10,6 +11,19 @@ import httpx
 import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.rtcdatachannel import RTCDataChannel
+
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(default_level: str = "INFO") -> None:
+    level_name = os.getenv("TITANI_LOG_LEVEL", default_level).upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    logger.debug("Logging inizializzato con livello %s", logging.getLevelName(level))
 
 
 @dataclass(slots=True)
@@ -33,20 +47,27 @@ async def maybe_handle_offer(ws: websockets.WebSocketClientProtocol, pc: RTCPeer
     If the first message is not an offer, it is ignored by this helper.
     """
 
+    logger.info("[webrtc] in attesa del primo messaggio di segnalazione")
     raw = await ws.recv()
+    logger.debug("[webrtc] primo messaggio ricevuto (%d bytes)", len(raw))
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
+        logger.warning("[webrtc] primo messaggio non JSON, handshake ignorato")
         return
 
     if msg.get("type") != "offer":
+        logger.info("[webrtc] primo messaggio non è un'offerta: type=%s", msg.get("type"))
         return
 
+    sdp = msg.get("sdp", "")
+    logger.info("[webrtc] offerta ricevuta, imposto remote description (sdp=%d bytes)", len(sdp))
     await pc.setRemoteDescription(RTCSessionDescription(sdp=msg["sdp"], type="offer"))
+    logger.info("[webrtc] remote description impostata, creo answer")
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
     await ws.send(json.dumps({"type": "answer", "sdp": pc.localDescription.sdp}))
-    print("[webrtc] answer inviato")
+    logger.info("[webrtc] answer inviato (%d bytes)", len(pc.localDescription.sdp))
 
 
 async def download_frame(http: httpx.AsyncClient, cfg: ErmeteConfig, payload: dict[str, Any]) -> Path:
@@ -63,7 +84,7 @@ async def download_frame(http: httpx.AsyncClient, cfg: ErmeteConfig, payload: di
     response = await http.get(url, headers=cfg.auth_headers(), timeout=30.0)
     response.raise_for_status()
     out_path.write_bytes(response.content)
-    print(f"[frames] scaricato -> {out_path} ({len(response.content)} bytes)")
+    logger.info("[frames] scaricato -> %s (%d bytes)", out_path, len(response.content))
     return out_path
 
 
@@ -73,7 +94,7 @@ async def iter_ws_json(ws: websockets.WebSocketClientProtocol):
         try:
             yield json.loads(raw)
         except Exception:
-            print(f"[ws] non-json: {raw!r}")
+            logger.warning("[ws] non-json: %r", raw)
 
 
 def run(coro):
@@ -91,7 +112,13 @@ class WebRTCCommandChannel:
 
         @pc.on("datachannel")
         def on_datachannel(channel: RTCDataChannel) -> None:
+            logger.info("[webrtc] datachannel ricevuto: %s", channel.label)
             if channel.label != self._label:
+                logger.debug(
+                    "[webrtc] datachannel ignorato: atteso=%s ricevuto=%s",
+                    self._label,
+                    channel.label,
+                )
                 return
             self._attach(channel)
 
@@ -100,12 +127,12 @@ class WebRTCCommandChannel:
 
         @channel.on("open")
         def _on_open() -> None:
-            print(f"[webrtc] data channel aperto: {channel.label}")
+            logger.info("[webrtc] data channel aperto: %s", channel.label)
             self._open_event.set()
 
         @channel.on("close")
         def _on_close() -> None:
-            print(f"[webrtc] data channel chiuso: {channel.label}")
+            logger.info("[webrtc] data channel chiuso: %s", channel.label)
             self._open_event.clear()
 
         @channel.on("message")
@@ -124,6 +151,7 @@ class WebRTCCommandChannel:
 
             if isinstance(payload, dict):
                 self._incoming.put_nowait(payload)
+                logger.debug("[webrtc] payload cmd ricevuto: keys=%s", sorted(payload.keys()))
 
         if channel.readyState == "open":
             self._open_event.set()
@@ -132,6 +160,7 @@ class WebRTCCommandChannel:
         await asyncio.wait_for(self._open_event.wait(), timeout=timeout_s)
         if self._channel is None or self._channel.readyState != "open":
             raise RuntimeError("data channel cmd non disponibile")
+        logger.debug("[webrtc] invio payload cmd: type=%s", payload.get("type"))
         self._channel.send(json.dumps(payload))
 
     async def iter_json(self):
