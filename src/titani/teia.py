@@ -22,25 +22,27 @@ async def describe_snapshot(http: httpx.AsyncClient, cfg: TeiaConfig, image_path
     if not cfg.llm_api_key:
         return "LLM_API_KEY non impostata: impossibile descrivere lo snapshot."
 
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        return "Dipendenza 'openai' non installata: usa `uv sync --extra teia`."
+
     b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
     mime = "image/jpeg" if image_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
 
-    payload = {
-        "model": cfg.llm_model,
-        "input": [{
+    client = AsyncOpenAI(api_key=cfg.llm_api_key, base_url=cfg.llm_base_url)
+    response = await client.responses.create(
+        model=cfg.llm_model,
+        input=[{
             "role": "user",
             "content": [
                 {"type": "input_text", "text": "Descrivi brevemente in italiano cosa vedi nello snapshot."},
                 {"type": "input_image", "image_url": f"data:{mime};base64,{b64}"},
             ],
         }],
-    }
-
-    headers = {"Authorization": f"Bearer {cfg.llm_api_key}"}
-    resp = await http.post(f"{cfg.llm_base_url.rstrip('/')}/responses", headers=headers, json=payload, timeout=60.0)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("output_text") or "Descrizione non disponibile."
+        timeout=60.0,
+    )
+    return response.output_text or "Descrizione non disponibile."
 
 
 async def teia_consumer(cfg: TeiaConfig) -> None:
