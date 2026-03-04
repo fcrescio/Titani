@@ -10,8 +10,9 @@ import numpy as np
 import websockets
 from aiortc import MediaStreamTrack, RTCPeerConnection
 from aiortc.mediastreams import AudioFrame
-from mlx_audio.stt import load as load_stt
-from mlx_audio.vad import VoiceActivityDetector, load as load_vad
+from mlx_audio.stt.utils import load_model as load_stt
+from mlx_audio.vad import VoiceActivityDetector
+from mlx_audio.vad.utils import load_model as load_vad
 
 from titani.common import ErmeteConfig, iter_ws_json, maybe_handle_offer, run
 

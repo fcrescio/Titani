@@ -17,7 +17,7 @@ teia = [
   "openai>=1.40.0",
 ]
 ceo = [
-  "mlx-audio>=0.1.0",
+  "mlx-audio>=0.3.1",
 ]
 crio = [
   "torch>=2.3.0",
