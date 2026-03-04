@@ -17,8 +17,8 @@ teia = [
   "openai>=1.40.0",
 ]
 ceo = [
-  "mlx-audio>=0.3.1",
-  "webrtcvad>=2.0.10",
+  "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@0547bec",
+  "webrtcvad-wheels>=2.0.14",
 ]
 crio = [
   "torch>=2.3.0",
