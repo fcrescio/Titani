@@ -68,10 +68,30 @@ async def describe_snapshot(http: httpx.AsyncClient, cfg: TeiaConfig, image_path
     return response.output_text or "Descrizione non disponibile."
 
 
+def to_response_input(history: list[dict[str, str]]) -> list[dict[str, object]]:
+    formatted_history: list[dict[str, object]] = []
+    for turn in history:
+        role = turn.get("role", "user")
+        content = str(turn.get("content", "")).strip()
+        if not content:
+            continue
+
+        text_type = "input_text" if role == "user" else "output_text"
+        formatted_history.append(
+            {
+                "type": "message",
+                "role": role,
+                "content": [{"type": text_type, "text": content}],
+            }
+        )
+
+    return formatted_history
+
+
 async def generate_reply(client, cfg: TeiaConfig, history: list[dict[str, str]]) -> str:
     response = await client.responses.create(
         model=cfg.llm_model,
-        input=history,
+        input=to_response_input(history),
         timeout=60.0,
     )
     return (response.output_text or "").strip()
