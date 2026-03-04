@@ -112,7 +112,12 @@ class WebRTCCommandChannel:
 
         @pc.on("datachannel")
         def on_datachannel(channel: RTCDataChannel) -> None:
-            logger.info("[webrtc] datachannel ricevuto: %s", channel.label)
+            logger.info(
+                "[webrtc] datachannel ricevuto: label=%s id=%s state=%s",
+                channel.label,
+                getattr(channel, "id", "-"),
+                channel.readyState,
+            )
             if channel.label != self._label:
                 logger.debug(
                     "[webrtc] datachannel ignorato: atteso=%s ricevuto=%s",
@@ -134,6 +139,10 @@ class WebRTCCommandChannel:
         def _on_close() -> None:
             logger.info("[webrtc] data channel chiuso: %s", channel.label)
             self._open_event.clear()
+
+        @channel.on("error")
+        def _on_error(error: Exception) -> None:
+            logger.warning("[webrtc] errore data channel %s: %s", channel.label, error)
 
         @channel.on("message")
         def _on_message(message: str | bytes) -> None:
@@ -157,7 +166,17 @@ class WebRTCCommandChannel:
             self._open_event.set()
 
     async def send_json(self, payload: dict[str, Any], timeout_s: float = 10.0) -> None:
-        await asyncio.wait_for(self._open_event.wait(), timeout=timeout_s)
+        try:
+            await asyncio.wait_for(self._open_event.wait(), timeout=timeout_s)
+        except TimeoutError as exc:
+            state = self._channel.readyState if self._channel is not None else "missing"
+            logger.warning(
+                "[webrtc] timeout apertura data channel (%ss), impossibile inviare type=%s (state=%s)",
+                timeout_s,
+                payload.get("type"),
+                state,
+            )
+            raise RuntimeError("data channel cmd non aperto") from exc
         if self._channel is None or self._channel.readyState != "open":
             raise RuntimeError("data channel cmd non disponibile")
         logger.debug("[webrtc] invio payload cmd: type=%s", payload.get("type"))
