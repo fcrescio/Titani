@@ -5,7 +5,7 @@ Consumers Python per il sistema Ermete/Iris, gestiti con `uv`.
 ## Consumer disponibili
 
 - **Teia**: riceve snapshot (`frame_available`), scarica il file, lo invia a una API LLM e pubblica sul websocket una descrizione testuale (`snapshot_description`).
-- **Ceo**: riceve audio WebRTC, usa una VAD leggera per rilevare silenzio e poi applica **Smart Turn v3** di `mlx-audio` (`mlx-community/smart-turn-v3`) per capire quando chi parla ha finito.
+- **Ceo**: riceve audio WebRTC, usa una VAD leggera per rilevare silenzio, applica **Smart Turn v3** di `mlx-audio` (`mlx-community/smart-turn-v3`) per capire quando chi parla ha finito e poi trascrive il turno con **Qwen3 ASR**.
 - **Crio**: riceve audio WebRTC e fa loopback basilare della traccia (pipeline torch/torchaudio placeholder).
 
 ## Setup rapido
@@ -40,3 +40,5 @@ Solo **Ceo**:
 
 - `CEO_SILENCE_MS_BEFORE_ENDPOINT` (default: `300`, millisecondi di silenzio prima di interrogare Smart Turn)
 - `CEO_SMART_TURN_THRESHOLD` (default: `0.5`, soglia per `predict_endpoint`)
+- `CEO_ASR_MODEL` (default: `mlx-community/Qwen3-ASR-0.6B-8bit`)
+- `CEO_ASR_LANGUAGE` (default: `Italian`)
