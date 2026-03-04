@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 import time
 import wave
 from dataclasses import dataclass
@@ -23,19 +24,102 @@ WEBRTC_CHUNK_MS = 30
 WEBRTC_CHUNK_SAMPLES = TARGET_SAMPLE_RATE * WEBRTC_CHUNK_MS // 1000
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(slots=True)
 class CeoConfig(ErmeteConfig):
     silence_ms_before_endpoint: int = int(os.getenv("CEO_SILENCE_MS_BEFORE_ENDPOINT", "300"))
     smart_turn_threshold: float = float(os.getenv("CEO_SMART_TURN_THRESHOLD", "0.5"))
     asr_model: str = os.getenv("CEO_ASR_MODEL", "mlx-community/Qwen3-ASR-0.6B-8bit")
     asr_language: str = os.getenv("CEO_ASR_LANGUAGE", "Italian")
+    debug_mode: bool = _env_bool("CEO_DEBUG_MODE", False)
+    debug_out_dir: str = os.getenv("CEO_DEBUG_OUT_DIR", "./ceo_debug")
+    debug_heartbeat_ms: int = int(os.getenv("CEO_DEBUG_HEARTBEAT_MS", "2000"))
+
+
+class CeoDebug:
+    def __init__(self, cfg: CeoConfig):
+        self._enabled = cfg.debug_mode
+        self._out_dir = Path(cfg.debug_out_dir)
+        self._heartbeat_ms = max(250, cfg.debug_heartbeat_ms)
+        self._last_heartbeat_ms = 0.0
+        self._seen_sample_rates: set[int] = set()
+        self._frame_count = 0
+        self._received_samples_16k = 0
+        self._saved_segments = 0
+        if self._enabled:
+            self._out_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[ceo][debug] modalità debug attiva, directory output: {self._out_dir.resolve()}")
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def observe_frame(self, input_sample_rate: int, frame_16k: np.ndarray) -> None:
+        if not self._enabled:
+            return
+
+        if input_sample_rate not in self._seen_sample_rates:
+            self._seen_sample_rates.add(input_sample_rate)
+            print(
+                "[ceo][debug] nuovo sample rate in ingresso "
+                f"{input_sample_rate}Hz (target pipeline: {TARGET_SAMPLE_RATE}Hz)"
+            )
+
+        self._frame_count += 1
+        self._received_samples_16k += int(frame_16k.size)
+        now_ms = time.monotonic() * 1000.0
+        if now_ms - self._last_heartbeat_ms < self._heartbeat_ms:
+            return
+
+        self._last_heartbeat_ms = now_ms
+        if frame_16k.size:
+            rms = float(np.sqrt(np.mean(np.square(frame_16k))))
+            peak = float(np.max(np.abs(frame_16k)))
+        else:
+            rms = 0.0
+            peak = 0.0
+
+        buffered_seconds = self._received_samples_16k / TARGET_SAMPLE_RATE
+        print(
+            "[ceo][debug] heartbeat audio: "
+            f"frame={self._frame_count} "
+            f"buffered_16k={buffered_seconds:.2f}s "
+            f"rms={rms:.6f} peak={peak:.6f}"
+        )
+
+    def save_segment_for_asr(self, audio_16k: np.ndarray) -> Path | None:
+        if not self._enabled:
+            return None
+
+        self._saved_segments += 1
+        segment_name = f"segment_{self._saved_segments:04d}_{int(time.time() * 1000)}.wav"
+        out_path = self._out_dir / segment_name
+
+        clipped = np.clip(audio_16k, -1.0, 1.0)
+        pcm16 = (clipped * 32767.0).astype(np.int16)
+        with wave.open(str(out_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(TARGET_SAMPLE_RATE)
+            wf.writeframes(pcm16.tobytes())
+
+        duration = (audio_16k.size / TARGET_SAMPLE_RATE) if audio_16k.size else 0.0
+        print(f"[ceo][debug] salvato segmento ASR: {out_path} ({duration:.2f}s)")
+        return out_path
 
 
 class SmartTurnPipeline:
     """Smart Turn v3 endpoint detection with 8s rolling context."""
 
-    def __init__(self, cfg: CeoConfig):
+    def __init__(self, cfg: CeoConfig, debug: CeoDebug | None = None):
         self._cfg = cfg
+        self._debug = debug
         self._vad = webrtcvad.Vad(2)
         self._model = load_vad("mlx-community/smart-turn-v3", strict=True)
         self._audio_context = np.zeros(0, dtype=np.float32)
@@ -87,6 +171,8 @@ class SmartTurnPipeline:
 
     def process(self, frame: AudioFrame) -> np.ndarray | None:
         frame_16k = self._resample_to_16k(self._frame_to_mono(frame), frame.sample_rate)
+        if self._debug is not None:
+            self._debug.observe_frame(frame.sample_rate, frame_16k)
         if frame_16k.size:
             self._audio_context = np.concatenate((self._audio_context, frame_16k))[-MAX_CONTEXT_SAMPLES:]
 
@@ -160,7 +246,8 @@ class AsrPipeline:
 
 async def ceo_consumer(cfg: CeoConfig) -> None:
     pc = RTCPeerConnection()
-    turn_pipeline = SmartTurnPipeline(cfg)
+    debug = CeoDebug(cfg)
+    turn_pipeline = SmartTurnPipeline(cfg, debug=debug)
     asr_pipeline = AsrPipeline(cfg)
     ws_send_lock = asyncio.Lock()
 
@@ -174,6 +261,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                 frame = await track.recv()
                 completed_audio = turn_pipeline.process(frame)
                 if completed_audio is not None:
+                    debug.save_segment_for_asr(completed_audio)
                     transcript = await asyncio.to_thread(asr_pipeline.transcribe, completed_audio)
                     message = {
                         "type": "speaker_turn_completed",
