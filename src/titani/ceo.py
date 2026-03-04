@@ -6,31 +6,22 @@ import numpy as np
 import websockets
 from aiortc import MediaStreamTrack, RTCPeerConnection
 from aiortc.mediastreams import AudioFrame
+from mlx_audio.vad import VoiceActivityDetector
 
 from titani.common import ErmeteConfig, iter_ws_json, maybe_handle_offer, run
 
 
 @dataclass(slots=True)
 class CeoConfig(ErmeteConfig):
-    vad_threshold: float = 0.01
+    pass
 
 
 class MlxVadPipeline:
-    """Minimal VAD pipeline designed for macOS + mlx-audio.
+    """Minimal VAD pipeline designed for macOS + mlx-audio."""
 
-    If mlx-audio is not available, falls back to a simple RMS threshold.
-    """
-
-    def __init__(self, threshold: float = 0.01):
-        self.threshold = threshold
-        self._mlx_vad = None
-        try:
-            from mlx_audio.vad import VoiceActivityDetector  # type: ignore
-
-            self._mlx_vad = VoiceActivityDetector()
-            print("[ceo] mlx-audio VAD attivo")
-        except Exception:
-            print("[ceo] mlx-audio non disponibile, fallback su RMS")
+    def __init__(self):
+        self._mlx_vad = VoiceActivityDetector()
+        print("[ceo] mlx-audio VAD attivo")
 
     def is_speech(self, frame: AudioFrame) -> bool:
         pcm = frame.to_ndarray()
@@ -39,17 +30,13 @@ class MlxVadPipeline:
         if np.max(np.abs(mono)) > 1.5:
             mono = mono / 32768.0
 
-        if self._mlx_vad is not None:
-            # API indicative: adaptarala se cambia nella versione reale di mlx-audio.
-            return bool(self._mlx_vad(mono, sample_rate=frame.sample_rate))
-
-        rms = float(np.sqrt(np.mean(mono ** 2)))
-        return rms >= self.threshold
+        # API indicative: adaptarala se cambia nella versione reale di mlx-audio.
+        return bool(self._mlx_vad(mono, sample_rate=frame.sample_rate))
 
 
 async def ceo_consumer(cfg: CeoConfig) -> None:
     pc = RTCPeerConnection()
-    pipeline = MlxVadPipeline(threshold=cfg.vad_threshold)
+    pipeline = MlxVadPipeline()
 
     @pc.on("track")
     async def on_track(track: MediaStreamTrack):

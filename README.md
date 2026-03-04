@@ -5,7 +5,7 @@ Consumers Python per il sistema Ermete/Iris, gestiti con `uv`.
 ## Consumer disponibili
 
 - **Teia**: riceve snapshot (`frame_available`), scarica il file, lo invia a una API LLM e pubblica sul websocket una descrizione testuale (`snapshot_description`).
-- **Ceo**: riceve audio WebRTC e lo elabora con una pipeline VAD pensata per `mlx-audio` (con fallback RMS).
+- **Ceo**: riceve audio WebRTC e lo elabora con una pipeline VAD basata su `mlx-audio` (dipendenza fondamentale).
 - **Crio**: riceve audio WebRTC e fa loopback basilare della traccia (pipeline torch/torchaudio placeholder).
 
 ## Setup rapido
