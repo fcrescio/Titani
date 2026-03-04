@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import math
+from contextlib import suppress
 from fractions import Fraction
 import os
 from pathlib import Path
@@ -244,6 +246,13 @@ class SmartTurnPipeline:
 
         return None
 
+    def reset_turn_state(self) -> None:
+        self._audio_context = np.zeros(0, dtype=np.float32)
+        self._turn_audio_chunks = []
+        self._in_user_turn = False
+        self._last_speech_ms = 0.0
+        self._checked_during_current_silence = False
+
 
 class AsrPipeline:
     def __init__(self, cfg: CeoConfig):
@@ -290,6 +299,10 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self._chunk_samples = max(1, self._sample_rate * WEBRTC_CHUNK_MS // 1000)
         self._pts = 0
         self._started_at: float | None = None
+        self._pending_chunks = 0
+        self._pending_lock = asyncio.Lock()
+        self._playback_idle = asyncio.Event()
+        self._playback_idle.set()
 
     def set_output_sample_rate(self, sample_rate: int) -> None:
         if sample_rate <= 0 or sample_rate == self._sample_rate:
@@ -320,6 +333,12 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         frame.time_base = Fraction(1, self._sample_rate)
         frame.pts = self._pts
         self._pts += pcm16.size
+
+        async with self._pending_lock:
+            self._pending_chunks = max(0, self._pending_chunks - 1)
+            if self._pending_chunks == 0:
+                self._playback_idle.set()
+
         return frame
 
     async def push_pcm16(self, audio_pcm16: np.ndarray, sample_rate: int) -> None:
@@ -327,12 +346,22 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
             return
 
         adapted = _resample_pcm16(audio_pcm16, sample_rate, self._sample_rate)
+        chunk_count = int(math.ceil(adapted.size / self._chunk_samples))
+        if chunk_count <= 0:
+            return
+
+        async with self._pending_lock:
+            self._pending_chunks += chunk_count
+            self._playback_idle.clear()
 
         for start in range(0, adapted.size, self._chunk_samples):
             pcm = np.ascontiguousarray(adapted[start : start + self._chunk_samples], dtype=np.int16)
             if pcm.size < self._chunk_samples:
                 pcm = np.pad(pcm, (0, self._chunk_samples - pcm.size))
             await self._queue.put(pcm)
+
+    async def wait_until_idle(self) -> None:
+        await self._playback_idle.wait()
 
 
 class TtsPipeline:
@@ -371,6 +400,9 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     pc.addTrack(outbound_track)
     logger.info("[webrtc] traccia audio outbound TTS aggiunta")
     cmd_send_lock = asyncio.Lock()
+    tts_idle = asyncio.Event()
+    tts_idle.set()
+    say_to_user_queue: asyncio.Queue[str] = asyncio.Queue()
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange() -> None:
@@ -380,30 +412,44 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     async def on_iceconnectionstatechange() -> None:
         logger.info("[webrtc] ice connection state -> %s", pc.iceConnectionState)
 
-    async def handle_say_to_user(payload: dict) -> None:
-        text = str(payload.get("text", "")).strip()
+    async def handle_say_to_user_text(text: str) -> None:
         if not text:
             return
 
         logger.info("[ceo] say_to_user ricevuto -> %r", text)
-        chunk_data = await asyncio.to_thread(lambda: list(tts_pipeline.stream_voice_design_pcm16(text)))
-        if not chunk_data:
-            logger.warning("[ceo] TTS non ha generato audio")
-            return
+        tts_idle.clear()
+        try:
+            chunk_data = await asyncio.to_thread(lambda: list(tts_pipeline.stream_voice_design_pcm16(text)))
+            if not chunk_data:
+                logger.warning("[ceo] TTS non ha generato audio")
+                return
 
-        chunk_audio = [item[0] for item in chunk_data]
-        tts_sample_rate = chunk_data[0][1]
-        full_audio = np.concatenate(chunk_audio)
-        if debug.enabled:
-            debug.save_tts_wav(full_audio, sample_rate=tts_sample_rate)
+            chunk_audio = [item[0] for item in chunk_data]
+            tts_sample_rate = chunk_data[0][1]
+            full_audio = np.concatenate(chunk_audio)
+            if debug.enabled:
+                debug.save_tts_wav(full_audio, sample_rate=tts_sample_rate)
 
-        await outbound_track.push_pcm16(full_audio, sample_rate=tts_sample_rate)
-        logger.info(
-            "[ceo] TTS inviato su WebRTC (%.2fs, src_sr=%sHz, dst_sr=%sHz)",
-            full_audio.size / max(1, tts_sample_rate),
-            tts_sample_rate,
-            outbound_track.output_sample_rate,
-        )
+            await outbound_track.push_pcm16(full_audio, sample_rate=tts_sample_rate)
+            await outbound_track.wait_until_idle()
+            logger.info(
+                "[ceo] TTS inviato su WebRTC (%.2fs, src_sr=%sHz, dst_sr=%sHz)",
+                full_audio.size / max(1, tts_sample_rate),
+                tts_sample_rate,
+                outbound_track.output_sample_rate,
+            )
+        finally:
+            tts_idle.set()
+
+    async def say_to_user_worker() -> None:
+        while True:
+            text = await say_to_user_queue.get()
+            try:
+                await handle_say_to_user_text(text)
+            finally:
+                say_to_user_queue.task_done()
+
+    say_to_user_worker_task = asyncio.create_task(say_to_user_worker())
 
     @pc.on("track")
     async def on_track(track: MediaStreamTrack):
@@ -415,6 +461,9 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
             while True:
                 frame = await track.recv()
                 outbound_track.set_output_sample_rate(int(frame.sample_rate or DEFAULT_WEBRTC_SAMPLE_RATE))
+                if not tts_idle.is_set():
+                    turn_pipeline.reset_turn_state()
+                    continue
                 completed_audio = turn_pipeline.process(frame)
                 if completed_audio is not None:
                     debug.save_segment_for_asr(completed_audio)
@@ -447,11 +496,18 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                     async with cmd_send_lock:
                         await cmd_channel.send_json({"type": "pong"})
                 elif t == "say_to_user" and data.get("producer") == "teia":
-                    asyncio.create_task(handle_say_to_user(data))
+                    text = str(data.get("text", "")).strip()
+                    if text:
+                        await say_to_user_queue.put(text)
                 else:
                     logger.info("[dc] msg: %s", data)
 
-        await consume_cmd_messages()
+        try:
+            await consume_cmd_messages()
+        finally:
+            say_to_user_worker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await say_to_user_worker_task
 
 
 def main() -> None:
