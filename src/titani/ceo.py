@@ -289,6 +289,7 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self._sample_rate = DEFAULT_WEBRTC_SAMPLE_RATE
         self._chunk_samples = max(1, self._sample_rate * WEBRTC_CHUNK_MS // 1000)
         self._pts = 0
+        self._started_at: float | None = None
 
     def set_output_sample_rate(self, sample_rate: int) -> None:
         if sample_rate <= 0 or sample_rate == self._sample_rate:
@@ -305,6 +306,15 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
 
     async def recv(self) -> AudioFrame:
         pcm16 = await self._queue.get()
+
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+        else:
+            expected_elapsed = self._pts / self._sample_rate
+            wait_s = (self._started_at + expected_elapsed) - time.monotonic()
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+
         frame = AudioFrame.from_ndarray(pcm16.reshape(1, -1), format="s16", layout="mono")
         frame.sample_rate = self._sample_rate
         frame.time_base = Fraction(1, self._sample_rate)
@@ -322,11 +332,6 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
             pcm = np.ascontiguousarray(adapted[start : start + self._chunk_samples], dtype=np.int16)
             if pcm.size < self._chunk_samples:
                 pcm = np.pad(pcm, (0, self._chunk_samples - pcm.size))
-            if self._queue.full():
-                try:
-                    _ = self._queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
             await self._queue.put(pcm)
 
 
