@@ -7,11 +7,11 @@ from dataclasses import dataclass
 from tempfile import NamedTemporaryFile
 
 import numpy as np
+import webrtcvad
 import websockets
 from aiortc import MediaStreamTrack, RTCPeerConnection
 from aiortc.mediastreams import AudioFrame
 from mlx_audio.stt.utils import load_model as load_stt
-from mlx_audio.vad import VoiceActivityDetector
 from mlx_audio.vad.utils import load_model as load_vad
 
 from titani.common import ErmeteConfig, iter_ws_json, maybe_handle_offer, run
@@ -19,6 +19,8 @@ from titani.common import ErmeteConfig, iter_ws_json, maybe_handle_offer, run
 TARGET_SAMPLE_RATE = 16_000
 MAX_CONTEXT_SECONDS = 8
 MAX_CONTEXT_SAMPLES = TARGET_SAMPLE_RATE * MAX_CONTEXT_SECONDS
+WEBRTC_CHUNK_MS = 30
+WEBRTC_CHUNK_SAMPLES = TARGET_SAMPLE_RATE * WEBRTC_CHUNK_MS // 1000
 
 
 @dataclass(slots=True)
@@ -34,7 +36,7 @@ class SmartTurnPipeline:
 
     def __init__(self, cfg: CeoConfig):
         self._cfg = cfg
-        self._vad = VoiceActivityDetector()
+        self._vad = webrtcvad.Vad(2)
         self._model = load_vad("mlx-community/smart-turn-v3", strict=True)
         self._audio_context = np.zeros(0, dtype=np.float32)
         self._turn_audio_chunks: list[np.ndarray] = []
@@ -66,9 +68,22 @@ class SmartTurnPipeline:
         dst_x = np.linspace(0.0, duration_s, num=target_size, endpoint=False)
         return np.interp(dst_x, src_x, audio).astype(np.float32)
 
-    def _is_speech(self, frame: AudioFrame) -> bool:
-        mono = self._frame_to_mono(frame)
-        return bool(self._vad(mono, sample_rate=frame.sample_rate))
+    def _is_speech(self, frame_16k: np.ndarray) -> bool:
+        if frame_16k.size < WEBRTC_CHUNK_SAMPLES:
+            return False
+
+        clipped = np.clip(frame_16k, -1.0, 1.0)
+        pcm16 = (clipped * 32767.0).astype(np.int16)
+
+        usable = (pcm16.size // WEBRTC_CHUNK_SAMPLES) * WEBRTC_CHUNK_SAMPLES
+        if usable == 0:
+            return False
+
+        for start in range(0, usable, WEBRTC_CHUNK_SAMPLES):
+            chunk = pcm16[start : start + WEBRTC_CHUNK_SAMPLES]
+            if self._vad.is_speech(chunk.tobytes(), TARGET_SAMPLE_RATE):
+                return True
+        return False
 
     def process(self, frame: AudioFrame) -> np.ndarray | None:
         frame_16k = self._resample_to_16k(self._frame_to_mono(frame), frame.sample_rate)
@@ -76,7 +91,7 @@ class SmartTurnPipeline:
             self._audio_context = np.concatenate((self._audio_context, frame_16k))[-MAX_CONTEXT_SAMPLES:]
 
         now_ms = time.monotonic() * 1000.0
-        speaking = self._is_speech(frame)
+        speaking = self._is_speech(frame_16k)
 
         if speaking:
             self._in_user_turn = True
