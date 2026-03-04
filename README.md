@@ -42,3 +42,6 @@ Solo **Ceo**:
 - `CEO_SMART_TURN_THRESHOLD` (default: `0.5`, soglia per `predict_endpoint`)
 - `CEO_ASR_MODEL` (default: `mlx-community/Qwen3-ASR-0.6B-8bit`)
 - `CEO_ASR_LANGUAGE` (default: `Italian`)
+- `CEO_DEBUG_MODE` (default: `false`, abilita heartbeat audio e dump segmenti per debug)
+- `CEO_DEBUG_OUT_DIR` (default: `./ceo_debug`, directory in cui salvare i segmenti `.wav` inviati ad ASR)
+- `CEO_DEBUG_HEARTBEAT_MS` (default: `2000`, frequenza log heartbeat audio in millisecondi)
