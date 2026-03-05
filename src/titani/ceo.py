@@ -18,7 +18,7 @@ import webrtcvad
 import websockets
 from av.audio.resampler import AudioResampler
 from aiortc import MediaStreamTrack, RTCPeerConnection
-from aiortc.mediastreams import AudioFrame
+from aiortc.mediastreams import AudioFrame, MediaStreamError
 from mlx_audio.stt.utils import load_model as load_stt
 from mlx_audio.tts.utils import load_model as load_tts
 from mlx_audio.vad.utils import load_model as load_vad
@@ -810,10 +810,14 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     tts_idle = asyncio.Event()
     tts_idle.set()
     say_to_user_queue: asyncio.Queue[str] = asyncio.Queue()
+    pump_tasks: set[asyncio.Task[None]] = set()
+    shutdown_lock = asyncio.Lock()
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange() -> None:
         logger.info("[webrtc] connection state -> %s", pc.connectionState)
+        if pc.connectionState in {"failed", "closed", "disconnected"}:
+            await shutdown_peer_connection()
 
     @pc.on("iceconnectionstatechange")
     async def on_iceconnectionstatechange() -> None:
@@ -877,6 +881,22 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
 
     say_to_user_worker_task = asyncio.create_task(say_to_user_worker())
 
+    async def shutdown_peer_connection() -> None:
+        async with shutdown_lock:
+            tasks = list(pump_tasks)
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with suppress(asyncio.CancelledError):
+                    await task
+
+            say_to_user_worker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await say_to_user_worker_task
+
+            if pc.connectionState != "closed":
+                await pc.close()
+
     @pc.on("track")
     async def on_track(track: MediaStreamTrack):
         logger.info("[webrtc] traccia in ingresso aperta: kind=%s id=%s", track.kind, getattr(track, "id", "-"))
@@ -884,34 +904,44 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
             return
 
         async def pump() -> None:
-            while True:
-                frame = await track.recv()
-                outbound_track.set_output_sample_rate(int(frame.sample_rate or DEFAULT_WEBRTC_SAMPLE_RATE))
-                if not tts_idle.is_set():
-                    turn_pipeline.reset_turn_state()
-                    continue
-                completed_audio = turn_pipeline.process(frame)
-                if completed_audio is not None:
-                    debug.save_segment_for_asr(completed_audio)
-                    transcript = await asyncio.to_thread(asr_pipeline.transcribe, completed_audio)
-                    if transcript:
-                        await asyncio.to_thread(speaker_pipeline.process_transcribed_segment, completed_audio)
-                    message = {
-                        "type": "speaker_turn_completed",
-                        "producer": "ceo",
-                        "ts": frame.time,
-                        "transcript": transcript,
-                        "asr_model": cfg.asr_model,
-                    }
-                    try:
-                        async with cmd_send_lock:
-                            await cmd_channel.send_json(message)
-                    except Exception:
-                        logger.exception("[ceo] invio speaker_turn_completed fallito")
+            try:
+                while True:
+                    frame = await track.recv()
+                    outbound_track.set_output_sample_rate(int(frame.sample_rate or DEFAULT_WEBRTC_SAMPLE_RATE))
+                    if not tts_idle.is_set():
+                        turn_pipeline.reset_turn_state()
                         continue
-                    logger.info("[ceo] turn-end -> %s", message)
+                    completed_audio = turn_pipeline.process(frame)
+                    if completed_audio is not None:
+                        debug.save_segment_for_asr(completed_audio)
+                        transcript = await asyncio.to_thread(asr_pipeline.transcribe, completed_audio)
+                        if transcript:
+                            await asyncio.to_thread(speaker_pipeline.process_transcribed_segment, completed_audio)
+                        message = {
+                            "type": "speaker_turn_completed",
+                            "producer": "ceo",
+                            "ts": frame.time,
+                            "transcript": transcript,
+                            "asr_model": cfg.asr_model,
+                        }
+                        try:
+                            async with cmd_send_lock:
+                                await cmd_channel.send_json(message)
+                        except Exception:
+                            logger.exception("[ceo] invio speaker_turn_completed fallito")
+                            continue
+                        logger.info("[ceo] turn-end -> %s", message)
+            except asyncio.CancelledError:
+                logger.info("[webrtc] pump annullato: track id=%s", getattr(track, "id", "-"))
+                raise
+            except MediaStreamError:
+                logger.info("[webrtc] stream terminato: track id=%s", getattr(track, "id", "-"))
+            except Exception:
+                logger.exception("[webrtc] errore inatteso nel pump: track id=%s", getattr(track, "id", "-"))
 
-        asyncio.create_task(pump())
+        task = asyncio.create_task(pump())
+        pump_tasks.add(task)
+        task.add_done_callback(pump_tasks.discard)
 
     logger.info("[ceo] connessione websocket verso backend: %s", cfg.ermete_ws)
     async with websockets.connect(cfg.ermete_ws, additional_headers=cfg.auth_headers()) as ws:
@@ -939,9 +969,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
         try:
             await consume_cmd_messages()
         finally:
-            say_to_user_worker_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await say_to_user_worker_task
+            await shutdown_peer_connection()
 
 
 def main() -> None:
