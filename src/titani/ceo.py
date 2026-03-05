@@ -33,6 +33,7 @@ WEBRTC_CHUNK_SAMPLES = TARGET_SAMPLE_RATE * WEBRTC_CHUNK_MS // 1000
 DEFAULT_WEBRTC_SAMPLE_RATE = 48_000
 OUTBOUND_PREBUFFER_CHUNKS = max(1, int(os.getenv("CEO_OUTBOUND_PREBUFFER_CHUNKS", "3")))
 OUTBOUND_MAX_BUFFER_MS = max(100, int(os.getenv("CEO_OUTBOUND_MAX_BUFFER_MS", "400")))
+INITIAL_WELCOME_MESSAGE = "Grazie per esserti connesso"
 
 logger = logging.getLogger(__name__)
 
@@ -803,6 +804,8 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     tts_idle = asyncio.Event()
     tts_idle.set()
     say_to_user_queue: asyncio.Queue[str] = asyncio.Queue()
+    initial_welcome_enqueued = False
+    initial_welcome_done = asyncio.Event()
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange() -> None:
@@ -865,6 +868,8 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
             text = await say_to_user_queue.get()
             try:
                 await handle_say_to_user_text(text)
+                if text == INITIAL_WELCOME_MESSAGE:
+                    initial_welcome_done.set()
             finally:
                 say_to_user_queue.task_done()
 
@@ -872,14 +877,23 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
 
     @pc.on("track")
     async def on_track(track: MediaStreamTrack):
+        nonlocal initial_welcome_enqueued
         logger.info("[webrtc] traccia in ingresso aperta: kind=%s id=%s", track.kind, getattr(track, "id", "-"))
         if track.kind != "audio":
             return
+
+        if not initial_welcome_enqueued:
+            initial_welcome_enqueued = True
+            await say_to_user_queue.put(INITIAL_WELCOME_MESSAGE)
+            logger.info("[ceo] messaggio di benvenuto accodato")
 
         async def pump() -> None:
             while True:
                 frame = await track.recv()
                 outbound_track.set_output_sample_rate(int(frame.sample_rate or DEFAULT_WEBRTC_SAMPLE_RATE))
+                if not initial_welcome_done.is_set():
+                    turn_pipeline.reset_turn_state()
+                    continue
                 if not tts_idle.is_set():
                     turn_pipeline.reset_turn_state()
                     continue
