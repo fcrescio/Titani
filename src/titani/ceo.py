@@ -630,7 +630,7 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
 
         def _make_frame(pcm16: np.ndarray) -> AudioFrame:
             # pcm16 is shape (samples,) mono int16
-            frame = AudioFrame.from_ndarray(pcm16, format="s16", layout="mono")
+            frame = AudioFrame.from_ndarray(pcm16.reshape(1, -1), format="s16", layout="mono")
             frame.sample_rate = sample_rate
             frame.pts = self._next_pts
             return frame
