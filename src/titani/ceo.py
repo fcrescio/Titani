@@ -603,6 +603,7 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self._max_buffer_ms = OUTBOUND_MAX_BUFFER_MS
         self._min_buffered_chunks_for_playback = self._prebuffer_chunks
         self._buffering = True
+        self._consumer_started = asyncio.Event()
 
     def set_output_sample_rate(self, sample_rate: int) -> None:
         if sample_rate <= 0 or sample_rate == self._sample_rate:
@@ -618,6 +619,8 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         return self._sample_rate
 
     async def recv(self) -> AudioFrame:
+        if not self._consumer_started.is_set():
+            self._consumer_started.set()
         dequeued = False
         try:
             pcm16 = self._queue.get_nowait()
@@ -687,6 +690,16 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
     async def wait_until_idle(self) -> None:
         await self._playback_idle.wait()
 
+    async def wait_consumer_started(self, timeout: float | None = None) -> bool:
+        try:
+            if timeout is None:
+                await self._consumer_started.wait()
+                return True
+            await asyncio.wait_for(self._consumer_started.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
 
 class TtsPipeline:
     def __init__(self, cfg: CeoConfig):
@@ -746,6 +759,11 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
             return
 
         logger.info("[ceo] say_to_user ricevuto -> %r", text)
+        ok = await outbound_track.wait_consumer_started(timeout=2.0)
+        if not ok:
+            logger.warning("TTS consumer not started yet; dropping or delaying say_to_user")
+            return
+
         tts_idle.clear()
         try:
             stream_iter = iter(tts_pipeline.stream_voice_design_pcm16(text))
