@@ -73,12 +73,12 @@ def _enable_opus_fec_in_sdp(sdp: str) -> str:
 
 
 def _remove_unmapped_dynamic_payload_types_from_sdp(sdp: str) -> str:
-    """Remove dynamic payload types declared in `m=` lines without a matching `a=rtpmap`.
+    """Remove payload types in `m=` lines that aiortc can't resolve.
 
-    Some peers occasionally advertise dynamic payload IDs (>=96) in an `m=` line
-    but omit the corresponding codec mapping line (`a=rtpmap:<pt> ...`). `aiortc`
-    fails to parse this malformed SDP and raises `RuntimeError: coroutine raised
-    StopIteration` while setting the remote description.
+    `aiortc` can raise `RuntimeError: coroutine raised StopIteration` when an SDP
+    section references payload IDs that have no codec mapping in that section.
+    This can happen for dynamic payloads (>=96) missing `a=rtpmap`, but also for
+    unknown static payload IDs.
     """
 
     lines = sdp.splitlines()
@@ -103,6 +103,7 @@ def _remove_unmapped_dynamic_payload_types_from_sdp(sdp: str) -> str:
             out.extend(section)
             continue
 
+        media_kind = m_parts[0][2:]
         media_payloads = m_parts[3:]
         mapped_payloads: set[str] = set()
         for attr in section[1:]:
@@ -111,16 +112,26 @@ def _remove_unmapped_dynamic_payload_types_from_sdp(sdp: str) -> str:
             payload = attr.split(":", 1)[1].split()[0]
             mapped_payloads.add(payload)
 
-        allowed_payloads = [
-            payload
-            for payload in media_payloads
-            if not payload.isdigit() or int(payload) < 96 or payload in mapped_payloads
-        ]
+        static_payload_types_by_media: dict[str, set[str]] = {
+            # RFC3551 / common static RTP payload types accepted without rtpmap.
+            "audio": {"0", "3", "4", "5", "6", "7", "8", "9", "10", "11", "13", "14", "15", "16", "17", "18"},
+            "video": {"26", "31", "32", "33", "34"},
+        }
+        static_payloads = static_payload_types_by_media.get(media_kind, set())
+
+        allowed_payloads = []
+        for payload in media_payloads:
+            if not payload.isdigit():
+                allowed_payloads.append(payload)
+                continue
+            if payload in mapped_payloads or payload in static_payloads:
+                allowed_payloads.append(payload)
 
         if len(allowed_payloads) != len(media_payloads):
             removed = sorted(set(media_payloads) - set(allowed_payloads))
             logger.warning(
-                "[webrtc] rimossi payload dinamici senza rtpmap dalla SDP: %s",
+                "[webrtc] rimossi payload non mappati/non supportati dalla SDP (%s): %s",
+                media_kind,
                 ",".join(removed),
             )
             m_parts = m_parts[:3] + allowed_payloads
