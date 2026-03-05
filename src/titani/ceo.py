@@ -5,6 +5,7 @@ import json
 from contextlib import suppress
 from fractions import Fraction
 import os
+import re
 from pathlib import Path
 import time
 import wave
@@ -422,7 +423,21 @@ class SpeakerEmbeddingPipeline:
                         trimmed_swapped,
                     )
 
+            def _looks_like_conv_layout_mismatch(error: ValueError) -> bool:
+                message = str(error)
+                if "conv.weight" not in message:
+                    return False
+                if "Expected shape" not in message or "received shape" not in message:
+                    return False
+                shape_match = re.search(r"Expected shape \(([^)]+)\) but received shape \(([^)]+)\)", message)
+                if shape_match is None:
+                    return False
+                expected = tuple(part.strip() for part in shape_match.group(1).split(",") if part.strip())
+                received = tuple(part.strip() for part in shape_match.group(2).split(",") if part.strip())
+                return len(expected) == 3 and len(received) == 3 and expected == (received[0], received[2], received[1])
+
             attempted_tags: list[str] = []
+            strict_failures: list[tuple[str, str]] = []
             selected_strategy: str | None = None
             selected_strict = True
             for tag, weights in candidate_weights:
@@ -432,7 +447,24 @@ class SpeakerEmbeddingPipeline:
                     selected_strategy = tag
                     break
                 except ValueError as exc:
-                    logger.warning(
+                    strict_failures.append((tag, str(exc)))
+                    if _looks_like_conv_layout_mismatch(exc):
+                        swapped_weights, swapped_count = _swap_conv_weight_layout(weights)
+                        if swapped_count:
+                            swapped_tag = f"{tag}:auto-swap-conv-layout({swapped_count})"
+                            attempted_tags.append(swapped_tag)
+                            try:
+                                speaker_model.load_weights(list(swapped_weights.items()), strict=True)
+                                selected_strategy = swapped_tag
+                                logger.info(
+                                    "[ceo] speaker encoder strict auto-fix layout (%s, strategy=%s)",
+                                    model_name,
+                                    swapped_tag,
+                                )
+                                break
+                            except ValueError as swapped_exc:
+                                strict_failures.append((swapped_tag, str(swapped_exc)))
+                    logger.debug(
                         "[ceo] speaker encoder strict load fallito (%s, strategy=%s): %s",
                         model_name,
                         tag,
@@ -456,6 +488,12 @@ class SpeakerEmbeddingPipeline:
                 selected_strict,
                 ",".join(attempted_tags),
             )
+            if strict_failures:
+                logger.info(
+                    "[ceo] speaker encoder strict fallback riuscito (%s, tentativi_falliti=%s)",
+                    model_name,
+                    ",".join(tag for tag, _ in strict_failures),
+                )
 
             mx.eval(speaker_model.parameters())
             speaker_model.eval()
