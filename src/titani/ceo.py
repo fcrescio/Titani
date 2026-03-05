@@ -63,7 +63,7 @@ class CeoConfig(ErmeteConfig):
         "CEO_TTS_INSTRUCT",
         "Una voce femminile adulta, calda e naturale, con tono colloquiale e ritmo medio.",
     )
-    tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.32"))
+    tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.04"))
     speaker_embedding_threshold: float = float(os.getenv("CEO_SPEAKER_EMBEDDING_THRESHOLD", "0.8"))
     speaker_embeddings_dir: str = os.getenv("CEO_SPEAKER_EMBEDDINGS_DIR", "./ceo_speakers")
     speaker_embedding_model: str = os.getenv(
@@ -621,6 +621,7 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
     def output_sample_rate(self) -> int:
         return self._sample_rate
 
+
     async def recv(self) -> AudioFrame:
         if not self._consumer_started.is_set():
             self._consumer_started.set()
@@ -628,101 +629,112 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         chunk_samples = int(self._chunk_samples)
         sample_rate = int(self._sample_rate)
 
-        def _silence() -> np.ndarray:
+        def _silence():
             return np.zeros(chunk_samples, dtype=np.int16)
 
         def _make_frame(pcm16: np.ndarray) -> AudioFrame:
-            # pcm16 is shape (samples,) mono int16
             frame = AudioFrame.from_ndarray(pcm16.reshape(1, -1), format="s16", layout="mono")
             frame.sample_rate = sample_rate
+            frame.time_base = Fraction(1, sample_rate)  # IMPORTANTISSIMO
             frame.pts = self._next_pts
             return frame
 
-        # Initialize pts tracking lazily
-        if self._next_pts is None:
-            self._next_pts = 0
+        # Prebuffer gate (FIX: niente await dentro il lock)
+        frame_to_return = None
+        sleep_s = 0.0
 
-        # ---------- 1) Prebuffer gate (NO dequeue while buffering) ----------
+        async with self._pending_lock:
+            if self._buffering and self._queue.qsize() < int(self._min_buffered_chunks_for_playback):
+                if self._started_at is None:
+                    self._started_at = time.monotonic()
+
+                frame_to_return = _make_frame(_silence())
+                self._next_pts += chunk_samples
+
+                target_t = self._started_at + (frame_to_return.pts / sample_rate)
+                sleep_s = target_t - time.monotonic()
+
+        # FUORI DAL LOCK
+        if frame_to_return is not None:
+            if sleep_s > 0:
+                await asyncio.sleep(sleep_s)
+            return frame_to_return
+
+        # (poi continui con il resto: uscita dal buffering, dequeue, ecc.)
         async with self._pending_lock:
             if self._buffering:
-                # Use the queue itself as truth; pending_chunks can drift in edge cases
-                qsz = self._queue.qsize()
-
-                # Not enough buffered yet -> output silence without consuming anything
-                if qsz < int(self._min_buffered_chunks_for_playback):
-                    frame = _make_frame(_silence())
-                    self._next_pts += chunk_samples
-
-                    if self._started_at is None:
-                        self._started_at = time.monotonic()
-                    target_t = self._started_at + (frame.pts / sample_rate)
-                    wait_s = target_t - time.monotonic()
-                    if wait_s > 0:
-                        await asyncio.sleep(wait_s)
-
-                    return frame
-
-                # We have enough buffered: switch to playback mode
                 self._buffering = False
                 if self._started_at is None:
                     self._started_at = time.monotonic()
-                # once playback starts, we're no longer "idle"
                 self._playback_idle.clear()
 
-        # ---------- 2) Playback: dequeue with small timeout ----------
+        # ---- Deadline-driven dequeue ----
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+
+        frame_pts = self._next_pts
+        target_t = self._started_at + (frame_pts / sample_rate)
+        remaining = target_t - time.monotonic()
+
         dequeued = False
-        try:
-            # Small timeout absorbs micro-jitter; tune 0.01–0.03 depending on chunk size
-            pcm16 = await asyncio.wait_for(self._queue.get(), timeout=0.02)
-            dequeued = True
-            if not isinstance(pcm16, np.ndarray):
-                pcm16 = np.asarray(pcm16, dtype=np.int16)
-            # Ensure correct shape/dtype
-            pcm16 = pcm16.astype(np.int16, copy=False).reshape(-1)
-            if pcm16.shape[0] != chunk_samples:
-                # If a wrong-sized chunk sneaks in, pad/trim rather than exploding
-                if pcm16.shape[0] < chunk_samples:
-                    pcm16 = np.pad(pcm16, (0, chunk_samples - pcm16.shape[0]), mode="constant")
-                else:
-                    pcm16 = pcm16[:chunk_samples]
-        except (asyncio.TimeoutError, asyncio.QueueEmpty):
-            logger.info("Timeout")
-            pcm16 = _silence()
+        if remaining > 0:
+            try:
+                pcm16 = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                dequeued = True
+            except asyncio.TimeoutError:
+                pcm16 = _silence()
+        else:
+            # siamo in ritardo: non aspettare, manda quel che c'è o silenzio
+            try:
+                pcm16 = self._queue.get_nowait()
+                dequeued = True
+            except asyncio.QueueEmpty:
+                pcm16 = _silence()
+
+        pcm16 = np.asarray(pcm16, dtype=np.int16).reshape(-1)
+        if pcm16.shape[0] != chunk_samples:
+            pcm16 = np.pad(pcm16[:chunk_samples], (0, max(0, chunk_samples - pcm16.shape[0])))
 
         frame = _make_frame(pcm16)
         self._next_pts += chunk_samples
 
-        # ---------- 3) Real-time pacing ----------
-        # Keep a stable time base: started_at anchors pts->time
-        if self._started_at is None:
-            self._started_at = time.monotonic()
-        target_t = self._started_at + (frame.pts / sample_rate)
+        # pacing finale (di solito remaining già gestisce; ma tenerlo non fa male)
         wait_s = target_t - time.monotonic()
         if wait_s > 0:
             await asyncio.sleep(wait_s)
 
-        # ---------- 4) Housekeeping (pending + buffering re-entry) ----------
         async with self._pending_lock:
             if dequeued:
-                # pending_chunks is optional book-keeping; keep it non-negative
                 self._pending_chunks = max(0, int(self._pending_chunks) - 1)
-
-            # If we've drained the queue, go back to buffering to avoid stutter
             if self._queue.qsize() == 0:
                 self._buffering = True
                 self._playback_idle.set()
 
         return frame
 
+    @staticmethod
+    def _prepare_chunks(audio_pcm16: np.ndarray, src_rate: int, dst_rate: int, chunk_samples: int) -> list[np.ndarray]:
+        adapted = _resample_pcm16(audio_pcm16, src_rate, dst_rate)
+        chunks: list[np.ndarray] = []
+        for start in range(0, adapted.size, chunk_samples):
+            pcm = np.ascontiguousarray(adapted[start : start + chunk_samples], dtype=np.int16)
+            if pcm.size < chunk_samples:
+                pcm = np.pad(pcm, (0, chunk_samples - pcm.size))
+            chunks.append(pcm)
+        return chunks
 
     async def push_pcm16(self, audio_pcm16: np.ndarray, sample_rate: int) -> None:
         if audio_pcm16.size == 0:
             return
 
-        adapted = _resample_pcm16(audio_pcm16, sample_rate, self._sample_rate)
-        chunk_count = int(math.ceil(adapted.size / self._chunk_samples))
-        if chunk_count <= 0:
+        # prepara chunk in thread (CPU heavy fuori event-loop)
+        chunks = await asyncio.to_thread(
+            type(self)._prepare_chunks, np.asarray(audio_pcm16, dtype=np.int16), int(sample_rate), int(self._sample_rate), int(self._chunk_samples)
+        )
+        if not chunks:
             return
+
+        chunk_count = len(chunks)
 
         async with self._pending_lock:
             self._pending_chunks += chunk_count
@@ -736,13 +748,8 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
                     chunks_to_drop -= 1
                 except asyncio.QueueEmpty:
                     break
-            if chunks_to_drop > 0:
-                logger.debug("[ceo] impossibile svuotare backlog completo (residuo=%s)", chunks_to_drop)
 
-        for start in range(0, adapted.size, self._chunk_samples):
-            pcm = np.ascontiguousarray(adapted[start : start + self._chunk_samples], dtype=np.int16)
-            if pcm.size < self._chunk_samples:
-                pcm = np.pad(pcm, (0, self._chunk_samples - pcm.size))
+        for pcm in chunks:
             await self._queue.put(pcm)
 
     async def wait_until_idle(self) -> None:
