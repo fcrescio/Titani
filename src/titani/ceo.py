@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 import json
+from collections import deque
 from contextlib import suppress
 from fractions import Fraction
 import os
@@ -169,13 +170,67 @@ class SmartTurnPipeline:
         self._debug = debug
         self._vad = webrtcvad.Vad(2)
         self._model = load_vad("mlx-community/smart-turn-v3", strict=True)
-        self._audio_context = np.zeros(0, dtype=np.float32)
-        self._turn_audio_chunks: list[np.ndarray] = []
+        self._audio_context_chunks: deque[np.ndarray] = deque()
+        self._audio_context_samples = 0
+        self._turn_audio_chunks: deque[np.ndarray] = deque()
+        self._turn_audio_samples = 0
         self._in_user_turn = False
         self._last_speech_ms = 0.0
         self._checked_during_current_silence = False
         self._audio_resampler = AudioResampler(format="s16", layout="mono", rate=TARGET_SAMPLE_RATE)
         logger.info("[ceo] Smart Turn v3 attivo (mlx-community/smart-turn-v3)")
+
+    def _append_context_frame(self, frame_16k: np.ndarray) -> None:
+        if frame_16k.size == 0:
+            return
+
+        if frame_16k.size >= MAX_CONTEXT_SAMPLES:
+            self._audio_context_chunks.clear()
+            self._audio_context_chunks.append(np.ascontiguousarray(frame_16k[-MAX_CONTEXT_SAMPLES:]))
+            self._audio_context_samples = int(self._audio_context_chunks[0].size)
+            return
+
+        frame_chunk = np.ascontiguousarray(frame_16k)
+        self._audio_context_chunks.append(frame_chunk)
+        self._audio_context_samples += int(frame_chunk.size)
+
+        while self._audio_context_samples > MAX_CONTEXT_SAMPLES and self._audio_context_chunks:
+            overflow = self._audio_context_samples - MAX_CONTEXT_SAMPLES
+            oldest = self._audio_context_chunks[0]
+
+            if oldest.size <= overflow:
+                self._audio_context_chunks.popleft()
+                self._audio_context_samples -= int(oldest.size)
+                continue
+
+            self._audio_context_chunks[0] = oldest[overflow:]
+            self._audio_context_samples -= overflow
+
+    def _append_turn_frame(self, frame_16k: np.ndarray) -> None:
+        if frame_16k.size == 0:
+            return
+
+        frame_chunk = np.ascontiguousarray(frame_16k)
+        self._turn_audio_chunks.append(frame_chunk)
+        self._turn_audio_samples += int(frame_chunk.size)
+
+    def _build_audio_context(self) -> np.ndarray:
+        if not self._audio_context_chunks:
+            return np.zeros(0, dtype=np.float32)
+        if len(self._audio_context_chunks) == 1:
+            return self._audio_context_chunks[0]
+        return np.concatenate(self._audio_context_chunks)
+
+    def _drain_turn_audio(self) -> np.ndarray:
+        if not self._turn_audio_chunks:
+            return np.zeros(0, dtype=np.float32)
+        if len(self._turn_audio_chunks) == 1:
+            completed_turn = self._turn_audio_chunks[0]
+        else:
+            completed_turn = np.concatenate(self._turn_audio_chunks)
+        self._turn_audio_chunks.clear()
+        self._turn_audio_samples = 0
+        return completed_turn
 
     def _frame_to_mono_16k(self, frame: AudioFrame) -> np.ndarray:
         resampled_frames = self._audio_resampler.resample(frame)
@@ -211,8 +266,7 @@ class SmartTurnPipeline:
         frame_16k = self._frame_to_mono_16k(frame)
         if self._debug is not None:
             self._debug.observe_frame(frame.sample_rate, frame_16k)
-        if frame_16k.size:
-            self._audio_context = np.concatenate((self._audio_context, frame_16k))[-MAX_CONTEXT_SAMPLES:]
+        self._append_context_frame(frame_16k)
 
         now_ms = time.monotonic() * 1000.0
         speaking = self._is_speech(frame_16k)
@@ -222,7 +276,7 @@ class SmartTurnPipeline:
             self._last_speech_ms = now_ms
             self._checked_during_current_silence = False
         if self._in_user_turn and frame_16k.size:
-            self._turn_audio_chunks.append(frame_16k)
+            self._append_turn_frame(frame_16k)
 
         if not speaking and not self._in_user_turn:
             return None
@@ -235,7 +289,7 @@ class SmartTurnPipeline:
             if self._checked_during_current_silence:
                 return None
 
-            segment_duration_s = self._audio_context.size / TARGET_SAMPLE_RATE
+            segment_duration_s = self._audio_context_samples / TARGET_SAMPLE_RATE
             min_segment_duration_s = max(0.0, self._cfg.smart_turn_min_segment_seconds)
             if segment_duration_s < min_segment_duration_s:
                 logger.info(
@@ -246,8 +300,9 @@ class SmartTurnPipeline:
                 return None
 
             self._checked_during_current_silence = True
+            audio_context = self._build_audio_context()
             result = self._model.predict_endpoint(
-                self._audio_context,
+                audio_context,
                 sample_rate=TARGET_SAMPLE_RATE,
                 threshold=self._cfg.smart_turn_threshold,
             )
@@ -258,20 +313,18 @@ class SmartTurnPipeline:
 
             if prediction == 1:
                 self._in_user_turn = False
-                self._audio_context = np.zeros(0, dtype=np.float32)
-                completed_turn = (
-                    np.concatenate(self._turn_audio_chunks)
-                    if self._turn_audio_chunks
-                    else np.zeros(0, dtype=np.float32)
-                )
-                self._turn_audio_chunks = []
+                self._audio_context_chunks.clear()
+                self._audio_context_samples = 0
+                completed_turn = self._drain_turn_audio()
                 return completed_turn
 
         return None
 
     def reset_turn_state(self) -> None:
-        self._audio_context = np.zeros(0, dtype=np.float32)
-        self._turn_audio_chunks = []
+        self._audio_context_chunks.clear()
+        self._audio_context_samples = 0
+        self._turn_audio_chunks.clear()
+        self._turn_audio_samples = 0
         self._in_user_turn = False
         self._last_speech_ms = 0.0
         self._checked_during_current_silence = False
