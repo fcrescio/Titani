@@ -63,6 +63,11 @@ class CeoConfig(ErmeteConfig):
     tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.32"))
     speaker_embedding_threshold: float = float(os.getenv("CEO_SPEAKER_EMBEDDING_THRESHOLD", "0.8"))
     speaker_embeddings_dir: str = os.getenv("CEO_SPEAKER_EMBEDDINGS_DIR", "./ceo_speakers")
+    speaker_embedding_model: str = os.getenv(
+        "CEO_SPEAKER_EMBEDDING_MODEL",
+        "marksverdhei/Qwen3-Voice-Embedding-12Hz-0.6B",
+    )
+    speaker_embedding_use_tts_fallback: bool = _env_bool("CEO_SPEAKER_EMBEDDING_USE_TTS_FALLBACK", True)
 
 
 class CeoDebug:
@@ -332,6 +337,7 @@ class SpeakerEmbeddingPipeline:
     def __init__(self, cfg: CeoConfig, tts_model):
         self._cfg = cfg
         self._tts_model = tts_model
+        self._speaker_embedding_model = self._load_standalone_speaker_encoder()
         self._target_sample_rate = 24_000
         self._threshold = float(np.clip(cfg.speaker_embedding_threshold, 0.0, 1.0))
         self._embeddings_dir = Path(cfg.speaker_embeddings_dir)
@@ -344,9 +350,56 @@ class SpeakerEmbeddingPipeline:
             self._threshold,
         )
 
+    def _load_standalone_speaker_encoder(self):
+        model_name = self._cfg.speaker_embedding_model.strip()
+        if not model_name:
+            return None
+
+        try:
+            import mlx.core as mx
+            from mlx_audio.tts.models.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
+            from mlx_audio.tts.models.qwen3_tts.speaker_encoder import Qwen3TTSSpeakerEncoder
+            from mlx_audio.utils import get_model_path, load_config, load_weights
+
+            model_path = get_model_path(model_name)
+            config = load_config(model_path)
+            speaker_cfg = Qwen3TTSSpeakerEncoderConfig(
+                **config.get("speaker_encoder_config", {}),
+            )
+            speaker_model = Qwen3TTSSpeakerEncoder(speaker_cfg)
+            weights = Qwen3TTSSpeakerEncoder.sanitize(load_weights(model_path))
+            speaker_model.load_weights(list(weights.items()), strict=True)
+            mx.eval(speaker_model.parameters())
+            speaker_model.eval()
+            logger.info("[ceo] speaker encoder dedicato caricato (%s)", model_name)
+            return speaker_model
+        except Exception:
+            logger.exception("[ceo] caricamento speaker encoder dedicato fallito (%s)", model_name)
+            return None
+
     def _extract_embedding(self, audio_16k: np.ndarray) -> np.ndarray:
-        audio_24k = _resample_float32(audio_16k, src_rate=TARGET_SAMPLE_RATE, dst_rate=self._target_sample_rate)
-        embedding = self._tts_model.extract_speaker_embedding(audio_24k, sr=self._target_sample_rate)
+        if self._speaker_embedding_model is not None:
+            import mlx.core as mx
+            from mlx_audio.tts.models.qwen3_tts.qwen3_tts import mel_spectrogram
+
+            audio_24k = _resample_float32(audio_16k, src_rate=TARGET_SAMPLE_RATE, dst_rate=self._target_sample_rate)
+            mels = mel_spectrogram(
+                mx.array(audio_24k),
+                n_fft=1024,
+                num_mels=128,
+                sample_rate=self._target_sample_rate,
+                hop_size=256,
+                win_size=1024,
+                fmin=0,
+                fmax=12_000,
+            )
+            embedding = self._speaker_embedding_model(mels)
+        elif self._cfg.speaker_embedding_use_tts_fallback:
+            audio_24k = _resample_float32(audio_16k, src_rate=TARGET_SAMPLE_RATE, dst_rate=self._target_sample_rate)
+            embedding = self._tts_model.extract_speaker_embedding(audio_24k, sr=self._target_sample_rate)
+        else:
+            raise RuntimeError("speaker encoder non disponibile e fallback TTS disattivato")
+
         if hasattr(embedding, "tolist"):
             embedding_np = np.asarray(embedding.tolist(), dtype=np.float32)
         else:
