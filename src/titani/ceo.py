@@ -833,7 +833,13 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                 if t == "ping":
                     async with cmd_send_lock:
                         await cmd_channel.send_json({"type": "pong"})
-                elif t == "say_to_user" and data.get("producer") == "teia":
+                elif t == "say_to_user":
+                    producer = str(data.get("producer", "")).strip() or "unknown"
+                    if producer != "teia":
+                        logger.warning(
+                            "[ceo] say_to_user ricevuto da producer inatteso (%s), continuo comunque",
+                            producer,
+                        )
                     text = str(data.get("text", "")).strip()
                     if text:
                         await say_to_user_queue.put(text)
