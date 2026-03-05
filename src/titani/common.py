@@ -72,6 +72,74 @@ def _enable_opus_fec_in_sdp(sdp: str) -> str:
     return "\r\n".join(updated) + "\r\n"
 
 
+def _remove_unmapped_dynamic_payload_types_from_sdp(sdp: str) -> str:
+    """Remove dynamic payload types declared in `m=` lines without a matching `a=rtpmap`.
+
+    Some peers occasionally advertise dynamic payload IDs (>=96) in an `m=` line
+    but omit the corresponding codec mapping line (`a=rtpmap:<pt> ...`). `aiortc`
+    fails to parse this malformed SDP and raises `RuntimeError: coroutine raised
+    StopIteration` while setting the remote description.
+    """
+
+    lines = sdp.splitlines()
+    out: list[str] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        if not line.startswith("m="):
+            out.append(line)
+            i += 1
+            continue
+
+        section: list[str] = [line]
+        i += 1
+        while i < len(lines) and not lines[i].startswith("m="):
+            section.append(lines[i])
+            i += 1
+
+        m_parts = section[0].split()
+        if len(m_parts) < 4:
+            out.extend(section)
+            continue
+
+        media_payloads = m_parts[3:]
+        mapped_payloads: set[str] = set()
+        for attr in section[1:]:
+            if not attr.startswith("a=rtpmap:"):
+                continue
+            payload = attr.split(":", 1)[1].split()[0]
+            mapped_payloads.add(payload)
+
+        allowed_payloads = [
+            payload
+            for payload in media_payloads
+            if not payload.isdigit() or int(payload) < 96 or payload in mapped_payloads
+        ]
+
+        if len(allowed_payloads) != len(media_payloads):
+            removed = sorted(set(media_payloads) - set(allowed_payloads))
+            logger.warning(
+                "[webrtc] rimossi payload dinamici senza rtpmap dalla SDP: %s",
+                ",".join(removed),
+            )
+            m_parts = m_parts[:3] + allowed_payloads
+            section[0] = " ".join(m_parts)
+            allowed_set = set(allowed_payloads)
+            filtered_section = [section[0]]
+            for attr in section[1:]:
+                if attr.startswith(("a=fmtp:", "a=rtcp-fb:", "a=rtpmap:")):
+                    payload = attr.split(":", 1)[1].split()[0]
+                    if payload.isdigit() and payload not in allowed_set:
+                        continue
+                filtered_section.append(attr)
+            section = filtered_section
+
+        out.extend(section)
+
+    return "\r\n".join(out) + "\r\n"
+
+
 async def maybe_handle_offer(ws: websockets.WebSocketClientProtocol, pc: RTCPeerConnection) -> None:
     """If the first WS message is an offer, reply with an answer and return.
 
@@ -92,6 +160,7 @@ async def maybe_handle_offer(ws: websockets.WebSocketClientProtocol, pc: RTCPeer
         return
 
     sdp = msg.get("sdp", "")
+    sdp = _remove_unmapped_dynamic_payload_types_from_sdp(sdp)
     sdp = _enable_opus_fec_in_sdp(sdp)
     logger.info("[webrtc] offerta ricevuta, imposto remote description (sdp=%d bytes)", len(sdp))
     await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
