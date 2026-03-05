@@ -430,22 +430,36 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
         logger.info("[ceo] say_to_user ricevuto -> %r", text)
         tts_idle.clear()
         try:
-            chunk_data = await asyncio.to_thread(lambda: list(tts_pipeline.stream_voice_design_pcm16(text)))
-            if not chunk_data:
+            stream_iter = iter(tts_pipeline.stream_voice_design_pcm16(text))
+            streamed_samples = 0
+            tts_sample_rate: int | None = None
+            accumulated_chunks: list[np.ndarray] = []
+
+            while True:
+                chunk = await asyncio.to_thread(lambda: next(stream_iter, None))
+                if chunk is None:
+                    break
+                pcm16_chunk, chunk_sample_rate = chunk
+                if pcm16_chunk.size == 0:
+                    continue
+                if tts_sample_rate is None:
+                    tts_sample_rate = chunk_sample_rate
+                streamed_samples += pcm16_chunk.size
+                accumulated_chunks.append(pcm16_chunk)
+                await outbound_track.push_pcm16(pcm16_chunk, sample_rate=chunk_sample_rate)
+
+            if streamed_samples == 0 or tts_sample_rate is None:
                 logger.warning("[ceo] TTS non ha generato audio")
                 return
 
-            chunk_audio = [item[0] for item in chunk_data]
-            tts_sample_rate = chunk_data[0][1]
-            full_audio = np.concatenate(chunk_audio)
             if debug.enabled:
+                full_audio = np.concatenate(accumulated_chunks)
                 debug.save_tts_wav(full_audio, sample_rate=tts_sample_rate)
 
-            await outbound_track.push_pcm16(full_audio, sample_rate=tts_sample_rate)
             await outbound_track.wait_until_idle()
             logger.info(
                 "[ceo] TTS inviato su WebRTC (%.2fs, src_sr=%sHz, dst_sr=%sHz)",
-                full_audio.size / max(1, tts_sample_rate),
+                streamed_samples / max(1, tts_sample_rate),
                 tts_sample_rate,
                 outbound_track.output_sample_rate,
             )
