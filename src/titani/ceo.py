@@ -734,23 +734,46 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         if not chunks:
             return
 
-        chunk_count = len(chunks)
+        dropped_old = 0
+        dropped_new = 0
 
         async with self._pending_lock:
-            self._pending_chunks += chunk_count
             self._playback_idle.clear()
             max_buffer_chunks = max(1, self._max_buffer_ms // WEBRTC_CHUNK_MS)
-            chunks_to_drop = max(0, self._pending_chunks - max_buffer_chunks)
-            while chunks_to_drop > 0 and not self._queue.empty():
-                try:
-                    self._queue.get_nowait()
-                    self._pending_chunks = max(0, self._pending_chunks - 1)
-                    chunks_to_drop -= 1
-                except asyncio.QueueEmpty:
-                    break
 
-        for pcm in chunks:
-            await self._queue.put(pcm)
+            for pcm in chunks:
+                while self._pending_chunks >= max_buffer_chunks and not self._queue.empty():
+                    try:
+                        self._queue.get_nowait()
+                        self._pending_chunks = max(0, self._pending_chunks - 1)
+                        dropped_old += 1
+                    except asyncio.QueueEmpty:
+                        break
+
+                while self._queue.full():
+                    try:
+                        self._queue.get_nowait()
+                        self._pending_chunks = max(0, self._pending_chunks - 1)
+                        dropped_old += 1
+                    except asyncio.QueueEmpty:
+                        break
+
+                try:
+                    self._queue.put_nowait(pcm)
+                    self._pending_chunks += 1
+                except asyncio.QueueFull:
+                    dropped_new += 1
+
+            if self._pending_chunks == 0 and self._queue.qsize() == 0:
+                self._playback_idle.set()
+
+        if dropped_old or dropped_new:
+            logger.warning(
+                "[ceo] outbound queue under backpressure: dropped_old=%s dropped_new=%s pending=%s",
+                dropped_old,
+                dropped_new,
+                self._pending_chunks,
+            )
 
     async def wait_until_idle(self) -> None:
         await self._playback_idle.wait()
