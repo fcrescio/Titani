@@ -43,6 +43,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 class CeoConfig(ErmeteConfig):
     silence_ms_before_endpoint: int = int(os.getenv("CEO_SILENCE_MS_BEFORE_ENDPOINT", "300"))
     smart_turn_threshold: float = float(os.getenv("CEO_SMART_TURN_THRESHOLD", "0.5"))
+    smart_turn_min_segment_seconds: float = float(os.getenv("CEO_SMART_TURN_MIN_SEGMENT_SECONDS", "3.0"))
     asr_model: str = os.getenv("CEO_ASR_MODEL", "mlx-community/Qwen3-ASR-0.6B-8bit")
     asr_language: str = os.getenv("CEO_ASR_LANGUAGE", "Italian")
     debug_mode: bool = _env_bool("CEO_DEBUG_MODE", False)
@@ -220,6 +221,16 @@ class SmartTurnPipeline:
                 return None
 
             if self._checked_during_current_silence:
+                return None
+
+            segment_duration_s = self._audio_context.size / TARGET_SAMPLE_RATE
+            min_segment_duration_s = max(0.0, self._cfg.smart_turn_min_segment_seconds)
+            if segment_duration_s < min_segment_duration_s:
+                logger.info(
+                    "[ceo] smart-turn rimandato: contesto=%.2fs < minimo=%.2fs",
+                    segment_duration_s,
+                    min_segment_duration_s,
+                )
                 return None
 
             self._checked_during_current_silence = True
