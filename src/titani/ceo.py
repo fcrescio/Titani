@@ -27,9 +27,11 @@ from titani.common import ErmeteConfig, WebRTCCommandChannel, maybe_handle_offer
 TARGET_SAMPLE_RATE = 16_000
 MAX_CONTEXT_SECONDS = 8
 MAX_CONTEXT_SAMPLES = TARGET_SAMPLE_RATE * MAX_CONTEXT_SECONDS
-WEBRTC_CHUNK_MS = 10
+WEBRTC_CHUNK_MS = int(os.getenv("CEO_WEBRTC_CHUNK_MS", "20"))
 WEBRTC_CHUNK_SAMPLES = TARGET_SAMPLE_RATE * WEBRTC_CHUNK_MS // 1000
 DEFAULT_WEBRTC_SAMPLE_RATE = 48_000
+OUTBOUND_PREBUFFER_CHUNKS = max(1, int(os.getenv("CEO_OUTBOUND_PREBUFFER_CHUNKS", "3")))
+OUTBOUND_MAX_BUFFER_MS = max(100, int(os.getenv("CEO_OUTBOUND_MAX_BUFFER_MS", "400")))
 
 logger = logging.getLogger(__name__)
 
@@ -467,6 +469,10 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self._pending_lock = asyncio.Lock()
         self._playback_idle = asyncio.Event()
         self._playback_idle.set()
+        self._prebuffer_chunks = OUTBOUND_PREBUFFER_CHUNKS
+        self._max_buffer_ms = OUTBOUND_MAX_BUFFER_MS
+        self._min_buffered_chunks_for_playback = self._prebuffer_chunks
+        self._buffering = True
 
     def set_output_sample_rate(self, sample_rate: int) -> None:
         if sample_rate <= 0 or sample_rate == self._sample_rate:
@@ -482,7 +488,18 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         return self._sample_rate
 
     async def recv(self) -> AudioFrame:
-        pcm16 = await self._queue.get()
+        dequeued = False
+        try:
+            pcm16 = self._queue.get_nowait()
+            dequeued = True
+        except asyncio.QueueEmpty:
+            pcm16 = np.zeros(self._chunk_samples, dtype=np.int16)
+
+        async with self._pending_lock:
+            if self._buffering and self._pending_chunks < self._min_buffered_chunks_for_playback:
+                pcm16 = np.zeros(self._chunk_samples, dtype=np.int16)
+            else:
+                self._buffering = False
 
         if self._started_at is None:
             self._started_at = time.monotonic()
@@ -499,8 +516,10 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self._pts += pcm16.size
 
         async with self._pending_lock:
-            self._pending_chunks = max(0, self._pending_chunks - 1)
+            if dequeued:
+                self._pending_chunks = max(0, self._pending_chunks - 1)
             if self._pending_chunks == 0:
+                self._buffering = True
                 self._playback_idle.set()
 
         return frame
@@ -517,6 +536,17 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         async with self._pending_lock:
             self._pending_chunks += chunk_count
             self._playback_idle.clear()
+            max_buffer_chunks = max(1, self._max_buffer_ms // WEBRTC_CHUNK_MS)
+            chunks_to_drop = max(0, self._pending_chunks - max_buffer_chunks)
+            while chunks_to_drop > 0 and not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                    self._pending_chunks = max(0, self._pending_chunks - 1)
+                    chunks_to_drop -= 1
+                except asyncio.QueueEmpty:
+                    break
+            if chunks_to_drop > 0:
+                logger.debug("[ceo] impossibile svuotare backlog completo (residuo=%s)", chunks_to_drop)
 
         for start in range(0, adapted.size, self._chunk_samples):
             pcm = np.ascontiguousarray(adapted[start : start + self._chunk_samples], dtype=np.int16)

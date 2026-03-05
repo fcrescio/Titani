@@ -41,6 +41,37 @@ class ErmeteConfig:
         return {self.psk_header: self.psk}
 
 
+def _enable_opus_fec_in_sdp(sdp: str) -> str:
+    lines = sdp.splitlines()
+    opus_payload_type: str | None = None
+
+    for line in lines:
+        if line.startswith("a=rtpmap:") and " opus/" in line.lower():
+            opus_payload_type = line.split(":", 1)[1].split()[0]
+            break
+
+    if opus_payload_type is None:
+        return sdp
+
+    updated: list[str] = []
+    fmtp_found = False
+    fec_key = "useinbandfec="
+
+    for line in lines:
+        if line.startswith(f"a=fmtp:{opus_payload_type} "):
+            fmtp_found = True
+            prefix, params = line.split(" ", 1)
+            if fec_key not in params:
+                params = f"{params};useinbandfec=1"
+            line = f"{prefix} {params}"
+        updated.append(line)
+
+    if not fmtp_found:
+        updated.append(f"a=fmtp:{opus_payload_type} useinbandfec=1")
+
+    return "\r\n".join(updated) + "\r\n"
+
+
 async def maybe_handle_offer(ws: websockets.WebSocketClientProtocol, pc: RTCPeerConnection) -> None:
     """If the first WS message is an offer, reply with an answer and return.
 
@@ -61,8 +92,9 @@ async def maybe_handle_offer(ws: websockets.WebSocketClientProtocol, pc: RTCPeer
         return
 
     sdp = msg.get("sdp", "")
+    sdp = _enable_opus_fec_in_sdp(sdp)
     logger.info("[webrtc] offerta ricevuta, imposto remote description (sdp=%d bytes)", len(sdp))
-    await pc.setRemoteDescription(RTCSessionDescription(sdp=msg["sdp"], type="offer"))
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
     logger.info("[webrtc] remote description impostata, creo answer")
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
