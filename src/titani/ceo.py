@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import json
 from contextlib import suppress
 from fractions import Fraction
 import os
@@ -8,6 +9,7 @@ from pathlib import Path
 import time
 import wave
 from dataclasses import dataclass
+from uuid import uuid4
 from tempfile import NamedTemporaryFile
 
 import numpy as np
@@ -59,6 +61,8 @@ class CeoConfig(ErmeteConfig):
         "Una voce femminile adulta, calda e naturale, con tono colloquiale e ritmo medio.",
     )
     tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.32"))
+    speaker_embedding_threshold: float = float(os.getenv("CEO_SPEAKER_EMBEDDING_THRESHOLD", "0.8"))
+    speaker_embeddings_dir: str = os.getenv("CEO_SPEAKER_EMBEDDINGS_DIR", "./ceo_speakers")
 
 
 class CeoDebug:
@@ -300,6 +304,102 @@ def _resample_pcm16(audio_pcm16: np.ndarray, src_rate: int, dst_rate: int) -> np
     return np.ascontiguousarray(np.clip(dst, -32768, 32767).astype(np.int16))
 
 
+def _resample_float32(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    if audio.size == 0 or src_rate <= 0 or dst_rate <= 0 or src_rate == dst_rate:
+        return np.ascontiguousarray(audio, dtype=np.float32)
+
+    src = np.ascontiguousarray(audio, dtype=np.float32)
+    src_len = src.size
+    dst_len = max(1, int(round(src_len * dst_rate / src_rate)))
+    src_x = np.linspace(0.0, 1.0, num=src_len, endpoint=False)
+    dst_x = np.linspace(0.0, 1.0, num=dst_len, endpoint=False)
+    dst = np.interp(dst_x, src_x, src)
+    return np.ascontiguousarray(np.clip(dst, -1.0, 1.0).astype(np.float32))
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size == 0 or b.size == 0:
+        return 0.0
+    a_flat = a.reshape(-1).astype(np.float32, copy=False)
+    b_flat = b.reshape(-1).astype(np.float32, copy=False)
+    denom = float(np.linalg.norm(a_flat) * np.linalg.norm(b_flat))
+    if denom <= 0:
+        return 0.0
+    return float(np.dot(a_flat, b_flat) / denom)
+
+
+class SpeakerEmbeddingPipeline:
+    def __init__(self, cfg: CeoConfig, tts_model):
+        self._cfg = cfg
+        self._tts_model = tts_model
+        self._target_sample_rate = 24_000
+        self._threshold = float(np.clip(cfg.speaker_embedding_threshold, 0.0, 1.0))
+        self._embeddings_dir = Path(cfg.speaker_embeddings_dir)
+        self._embeddings_dir.mkdir(parents=True, exist_ok=True)
+        self._last_embedding: np.ndarray | None = None
+        self._last_embedding_id: str | None = None
+        logger.info(
+            "[ceo] speaker embedding attivo (dir=%s, threshold=%.3f)",
+            self._embeddings_dir.resolve(),
+            self._threshold,
+        )
+
+    def _extract_embedding(self, audio_16k: np.ndarray) -> np.ndarray:
+        audio_24k = _resample_float32(audio_16k, src_rate=TARGET_SAMPLE_RATE, dst_rate=self._target_sample_rate)
+        embedding = self._tts_model.extract_speaker_embedding(audio_24k, sr=self._target_sample_rate)
+        if hasattr(embedding, "tolist"):
+            embedding_np = np.asarray(embedding.tolist(), dtype=np.float32)
+        else:
+            embedding_np = np.asarray(embedding, dtype=np.float32)
+        return np.ascontiguousarray(embedding_np.reshape(-1), dtype=np.float32)
+
+    def process_transcribed_segment(self, audio_16k: np.ndarray) -> None:
+        if audio_16k.size == 0:
+            return
+
+        try:
+            current_embedding = self._extract_embedding(audio_16k)
+        except Exception:
+            logger.exception("[ceo] estrazione speaker embedding fallita")
+            return
+
+        if self._last_embedding is not None:
+            similarity = _cosine_similarity(self._last_embedding, current_embedding)
+            probability_same_speaker = max(0.0, min(1.0, (similarity + 1.0) / 2.0))
+            logger.debug(
+                "[ceo][debug] prob stesso speaker=%.4f (sim=%.4f, prev_id=%s)",
+                probability_same_speaker,
+                similarity,
+                self._last_embedding_id,
+            )
+            if probability_same_speaker >= self._threshold:
+                logger.info(
+                    "[ceo] speaker invariato (prob=%.4f >= threshold=%.3f)",
+                    probability_same_speaker,
+                    self._threshold,
+                )
+                return
+
+        embedding_id = f"spk_{uuid4().hex}"
+        embedding_path = self._embeddings_dir / f"{embedding_id}.npy"
+        metadata_path = self._embeddings_dir / f"{embedding_id}.json"
+        np.save(embedding_path, current_embedding)
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "id": embedding_id,
+                    "sample_rate": self._target_sample_rate,
+                    "threshold": self._threshold,
+                    "created_at_ms": int(time.time() * 1000),
+                },
+                indent=2,
+            )
+        )
+        self._last_embedding = current_embedding
+        self._last_embedding_id = embedding_id
+        logger.info("[ceo] nuovo speaker embedding salvato: %s", embedding_path)
+
+
 class TtsOutboundAudioTrack(MediaStreamTrack):
     kind = "audio"
 
@@ -381,6 +481,10 @@ class TtsPipeline:
         self._model = load_tts(cfg.tts_model)
         logger.info("[ceo] TTS attivo (%s, language=%s)", cfg.tts_model, cfg.tts_language)
 
+    @property
+    def model(self):
+        return self._model
+
     def stream_voice_design_pcm16(self, text: str):
         if not text.strip():
             return
@@ -407,6 +511,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     turn_pipeline = SmartTurnPipeline(cfg, debug=debug)
     asr_pipeline = AsrPipeline(cfg)
     tts_pipeline = TtsPipeline(cfg)
+    speaker_pipeline = SpeakerEmbeddingPipeline(cfg, tts_pipeline.model)
     outbound_track = TtsOutboundAudioTrack()
     pc.addTrack(outbound_track)
     logger.info("[webrtc] traccia audio outbound TTS aggiunta")
@@ -493,6 +598,8 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                 if completed_audio is not None:
                     debug.save_segment_for_asr(completed_audio)
                     transcript = await asyncio.to_thread(asr_pipeline.transcribe, completed_audio)
+                    if transcript:
+                        await asyncio.to_thread(speaker_pipeline.process_transcribed_segment, completed_audio)
                     message = {
                         "type": "speaker_turn_completed",
                         "producer": "ceo",
