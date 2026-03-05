@@ -409,7 +409,14 @@ class SpeakerEmbeddingPipeline:
             if raw_swapped_count:
                 _register_candidate(f"raw:swap-conv-layout({raw_swapped_count})", raw_swapped)
 
-            for prefix in ("speaker_encoder.", "model.speaker_encoder.", "module.speaker_encoder."):
+            for prefix in (
+                "speaker_encoder.",
+                "model.speaker_encoder.",
+                "module.speaker_encoder.",
+                "encoder.",
+                "model.encoder.",
+                "module.encoder.",
+            ):
                 trimmed = {
                     key[len(prefix) :]: value
                     for key, value in raw_weights.items()
