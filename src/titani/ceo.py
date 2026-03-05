@@ -594,6 +594,7 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self._sample_rate = DEFAULT_WEBRTC_SAMPLE_RATE
         self._chunk_samples = max(1, self._sample_rate * WEBRTC_CHUNK_MS // 1000)
         self._pts = 0
+        self._next_pts = 0
         self._started_at: float | None = None
         self._pending_chunks = 0
         self._pending_lock = asyncio.Lock()
@@ -612,6 +613,8 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self._sample_rate = sample_rate
         self._chunk_samples = max(1, self._sample_rate * WEBRTC_CHUNK_MS // 1000)
         self._pts = 0
+        self._next_pts = 0
+        self._started_at: float | None = None
         logger.info("[ceo] outbound sample rate aggiornato a %sHz", self._sample_rate)
 
     @property
@@ -636,7 +639,8 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
             return frame
 
         # Initialize pts tracking lazily
-        self._next_pts = 0
+        if self._next_pts is None:
+            self._next_pts = 0
 
         # ---------- 1) Prebuffer gate (NO dequeue while buffering) ----------
         async with self._pending_lock:
@@ -649,7 +653,8 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
                     frame = _make_frame(_silence())
                     self._next_pts += chunk_samples
 
-                    self._started_at = time.monotonic()
+                    if self._started_at is None:
+                        self._started_at = time.monotonic()
                     target_t = self._started_at + (frame.pts / sample_rate)
                     wait_s = target_t - time.monotonic()
                     if wait_s > 0:
@@ -659,7 +664,8 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
 
                 # We have enough buffered: switch to playback mode
                 self._buffering = False
-                self._started_at = time.monotonic()
+                if self._started_at is None:
+                    self._started_at = time.monotonic()
                 # once playback starts, we're no longer "idle"
                 self._playback_idle.clear()
 
@@ -680,6 +686,7 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
                 else:
                     pcm16 = pcm16[:chunk_samples]
         except (asyncio.TimeoutError, asyncio.QueueEmpty):
+            logger.info("Timeout")
             pcm16 = _silence()
 
         frame = _make_frame(pcm16)
@@ -687,7 +694,8 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
 
         # ---------- 3) Real-time pacing ----------
         # Keep a stable time base: started_at anchors pts->time
-        self._started_at = time.monotonic()
+        if self._started_at is None:
+            self._started_at = time.monotonic()
         target_t = self._started_at + (frame.pts / sample_rate)
         wait_s = target_t - time.monotonic()
         if wait_s > 0:
