@@ -1,10 +1,12 @@
 import asyncio
 import base64
+import json
 import logging
 import os
 import string
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 import websockets
@@ -88,12 +90,103 @@ def to_response_input(history: list[dict[str, str]]) -> list[dict[str, object]]:
     return formatted_history
 
 
-async def generate_reply(client, cfg: TeiaConfig, history: list[dict[str, str]]) -> str:
+def _iter_function_calls(response: Any) -> list[dict[str, str]]:
+    calls: list[dict[str, str]] = []
+    for item in getattr(response, "output", []) or []:
+        item_type = getattr(item, "type", None)
+        if item_type != "function_call":
+            continue
+
+        name = getattr(item, "name", "") or ""
+        call_id = getattr(item, "call_id", "") or ""
+        arguments = getattr(item, "arguments", "") or ""
+        if name and call_id:
+            calls.append({"name": name, "call_id": call_id, "arguments": arguments})
+    return calls
+
+
+async def generate_reply(client, cfg: TeiaConfig, history: list[dict[str, str]], snapshot_tool) -> str:
+    tools = [
+        {
+            "type": "function",
+            "name": "take_snapshot",
+            "description": (
+                "Scatta una foto della vista corrente quando l'utente o il contesto richiedono "
+                "di osservare la scena reale."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Motivazione breve per cui serve lo snapshot.",
+                    }
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        }
+    ]
+
     response = await client.responses.create(
         model=cfg.llm_model,
         input=to_response_input(history),
+        tools=tools,
         timeout=60.0,
     )
+
+    for _ in range(3):
+        function_calls = _iter_function_calls(response)
+        if not function_calls:
+            break
+
+        followup_input: list[dict[str, Any]] = []
+        for function_call in function_calls:
+            if function_call["name"] != "take_snapshot":
+                followup_input.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": function_call["call_id"],
+                        "output": json.dumps({"error": f"Tool non supportato: {function_call['name']}"}),
+                    }
+                )
+                continue
+
+            result = await snapshot_tool()
+            followup_input.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": function_call["call_id"],
+                    "output": json.dumps(
+                        {
+                            "status": "ok",
+                            "frame_id": result["frame_id"],
+                            "file_name": result["file_name"],
+                            "description": result["description"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+            followup_input.append(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Ecco lo snapshot richiesto."},
+                        {"type": "input_image", "image_url": result["image_url"]},
+                    ],
+                }
+            )
+
+        response = await client.responses.create(
+            model=cfg.llm_model,
+            previous_response_id=response.id,
+            input=followup_input,
+            tools=tools,
+            timeout=60.0,
+        )
+
     return (response.output_text or "").strip()
 
 
@@ -125,10 +218,27 @@ async def teia_consumer(cfg: TeiaConfig) -> None:
     else:
         logger.warning("[teia] LLM_API_KEY non configurata: disattivata gestione speaker_turn_completed")
 
+    snapshot_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
     async with httpx.AsyncClient() as http:
         logger.info("[teia] connessione websocket verso backend: %s", cfg.ermete_ws)
         async with websockets.connect(cfg.ermete_ws, additional_headers=cfg.auth_headers()) as ws:
             await maybe_handle_offer(ws, pc)
+
+            async def run_snapshot_tool() -> dict[str, Any]:
+                await cmd_channel.send_json({"type": "snapshot"})
+                logger.info("[teia] tool take_snapshot: comando snapshot inviato sul data channel")
+                event = await asyncio.wait_for(snapshot_events.get(), timeout=20.0)
+                image_path: Path = event["path"]
+                description = await describe_snapshot(http, cfg, image_path)
+                mime = "image/jpeg" if image_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+                b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+                return {
+                    "frame_id": event.get("frame_id"),
+                    "file_name": event.get("file_name"),
+                    "description": description,
+                    "image_url": f"data:{mime};base64,{b64}",
+                }
 
             async def consume_data_channel() -> None:
                 async for data in cmd_channel.iter_json():
@@ -149,7 +259,7 @@ async def teia_consumer(cfg: TeiaConfig) -> None:
                         llm_history[:] = llm_history[-(cfg.llm_history_max_turns * 2) :]
 
                         try:
-                            reply = await generate_reply(llm_client, cfg, llm_history)
+                            reply = await generate_reply(llm_client, cfg, llm_history, run_snapshot_tool)
                         except Exception:
                             logger.exception("[teia] errore chiamata LLM")
                             continue
@@ -172,16 +282,14 @@ async def teia_consumer(cfg: TeiaConfig) -> None:
                         continue
 
                     out_path = await download_frame(http, cfg, data)
-                    description = await describe_snapshot(http, cfg, out_path)
-                    message = {
-                        "type": "snapshot_description",
-                        "producer": "teia",
-                        "frame_id": data.get("frame_id"),
-                        "file_name": data.get("file_name"),
-                        "description": description,
-                    }
-                    await cmd_channel.send_json(message)
-                    logger.info("[teia] snapshot_description inviato: frame_id=%s", data.get("frame_id"))
+                    await snapshot_events.put(
+                        {
+                            "frame_id": data.get("frame_id"),
+                            "file_name": data.get("file_name"),
+                            "path": out_path,
+                        }
+                    )
+                    logger.info("[teia] snapshot ricevuto e accodato: frame_id=%s", data.get("frame_id"))
 
             await asyncio.gather(consume_data_channel(), consume_websocket())
 
