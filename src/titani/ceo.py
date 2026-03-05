@@ -391,8 +391,22 @@ class SpeakerEmbeddingPipeline:
                 seen_signatures.add(signature)
                 candidate_weights.append((tag, values))
 
+            def _swap_conv_weight_layout(weights: dict):
+                swapped: dict = {}
+                swapped_count = 0
+                for key, value in weights.items():
+                    if key.endswith("conv.weight") and hasattr(value, "shape") and len(value.shape) == 3:
+                        swapped[key] = mx.transpose(value, (0, 2, 1))
+                        swapped_count += 1
+                    else:
+                        swapped[key] = value
+                return swapped, swapped_count
+
             _register_candidate("sanitize", Qwen3TTSSpeakerEncoder.sanitize(dict(raw_weights)))
             _register_candidate("raw", dict(raw_weights))
+            raw_swapped, raw_swapped_count = _swap_conv_weight_layout(dict(raw_weights))
+            if raw_swapped_count:
+                _register_candidate(f"raw:swap-conv-layout({raw_swapped_count})", raw_swapped)
 
             for prefix in ("speaker_encoder.", "model.speaker_encoder.", "module.speaker_encoder."):
                 trimmed = {
@@ -401,6 +415,12 @@ class SpeakerEmbeddingPipeline:
                     if key.startswith(prefix)
                 }
                 _register_candidate(f"trim:{prefix}", trimmed)
+                trimmed_swapped, trimmed_swapped_count = _swap_conv_weight_layout(trimmed)
+                if trimmed_swapped_count:
+                    _register_candidate(
+                        f"trim:{prefix}:swap-conv-layout({trimmed_swapped_count})",
+                        trimmed_swapped,
+                    )
 
             attempted_tags: list[str] = []
             selected_strategy: str | None = None
