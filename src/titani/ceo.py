@@ -365,15 +365,80 @@ class SpeakerEmbeddingPipeline:
 
             model_path = get_model_path(model_name)
             config = load_config(model_path)
+            cfg_fields = getattr(Qwen3TTSSpeakerEncoderConfig, "__dataclass_fields__", {})
+            root_cfg = {name: config[name] for name in cfg_fields if name in config}
+            speaker_cfg_values = dict(config.get("speaker_encoder_config", {}))
+            if not speaker_cfg_values:
+                speaker_cfg_values = root_cfg
+            else:
+                for name, value in root_cfg.items():
+                    speaker_cfg_values.setdefault(name, value)
             speaker_cfg = Qwen3TTSSpeakerEncoderConfig(
-                **config.get("speaker_encoder_config", {}),
+                **speaker_cfg_values,
             )
             speaker_model = Qwen3TTSSpeakerEncoder(speaker_cfg)
-            weights = Qwen3TTSSpeakerEncoder.sanitize(load_weights(model_path))
-            speaker_model.load_weights(list(weights.items()), strict=True)
+
+            raw_weights = load_weights(model_path)
+            candidate_weights: list[tuple[str, dict]] = []
+            seen_signatures: set[tuple[str, ...]] = set()
+
+            def _register_candidate(tag: str, values: dict):
+                if not values:
+                    return
+                signature = tuple(sorted(values.keys()))
+                if signature in seen_signatures:
+                    return
+                seen_signatures.add(signature)
+                candidate_weights.append((tag, values))
+
+            _register_candidate("sanitize", Qwen3TTSSpeakerEncoder.sanitize(dict(raw_weights)))
+            _register_candidate("raw", dict(raw_weights))
+
+            for prefix in ("speaker_encoder.", "model.speaker_encoder.", "module.speaker_encoder."):
+                trimmed = {
+                    key[len(prefix) :]: value
+                    for key, value in raw_weights.items()
+                    if key.startswith(prefix)
+                }
+                _register_candidate(f"trim:{prefix}", trimmed)
+
+            attempted_tags: list[str] = []
+            selected_strategy: str | None = None
+            selected_strict = True
+            for tag, weights in candidate_weights:
+                attempted_tags.append(tag)
+                try:
+                    speaker_model.load_weights(list(weights.items()), strict=True)
+                    selected_strategy = tag
+                    break
+                except ValueError as exc:
+                    logger.warning(
+                        "[ceo] speaker encoder strict load fallito (%s, strategy=%s): %s",
+                        model_name,
+                        tag,
+                        exc,
+                    )
+
+            if selected_strategy is None:
+                if not candidate_weights:
+                    raise ValueError("nessun set di pesi valido trovato nel checkpoint")
+                tag, weights = candidate_weights[-1]
+                attempted_tags.append(f"{tag}:strict=False")
+                speaker_model.load_weights(list(weights.items()), strict=False)
+                selected_strategy = tag
+                selected_strict = False
+
+            log_level = logger.info if selected_strict else logger.warning
+            log_level(
+                "[ceo] speaker encoder dedicato caricato (%s, strategy=%s, strict=%s, attempted=%s)",
+                model_name,
+                selected_strategy,
+                selected_strict,
+                ",".join(attempted_tags),
+            )
+
             mx.eval(speaker_model.parameters())
             speaker_model.eval()
-            logger.info("[ceo] speaker encoder dedicato caricato (%s)", model_name)
             return speaker_model
         except Exception:
             logger.exception("[ceo] caricamento speaker encoder dedicato fallito (%s)", model_name)
