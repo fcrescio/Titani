@@ -621,41 +621,91 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
     async def recv(self) -> AudioFrame:
         if not self._consumer_started.is_set():
             self._consumer_started.set()
+
+        chunk_samples = int(self._chunk_samples)
+        sample_rate = int(self._sample_rate)
+
+        def _silence() -> np.ndarray:
+            return np.zeros(chunk_samples, dtype=np.int16)
+
+        def _make_frame(pcm16: np.ndarray) -> AudioFrame:
+            # pcm16 is shape (samples,) mono int16
+            frame = AudioFrame.from_ndarray(pcm16, format="s16", layout="mono")
+            frame.sample_rate = sample_rate
+            frame.pts = self._next_pts
+            return frame
+
+        # Initialize pts tracking lazily
+        self._next_pts = 0
+
+        # ---------- 1) Prebuffer gate (NO dequeue while buffering) ----------
+        async with self._pending_lock:
+            if self._buffering:
+                # Use the queue itself as truth; pending_chunks can drift in edge cases
+                qsz = self._queue.qsize()
+
+                # Not enough buffered yet -> output silence without consuming anything
+                if qsz < int(self._min_buffered_chunks_for_playback):
+                    frame = _make_frame(_silence())
+                    self._next_pts += chunk_samples
+
+                    self._started_at = time.monotonic()
+                    target_t = self._started_at + (frame.pts / sample_rate)
+                    wait_s = target_t - time.monotonic()
+                    if wait_s > 0:
+                        await asyncio.sleep(wait_s)
+
+                    return frame
+
+                # We have enough buffered: switch to playback mode
+                self._buffering = False
+                self._started_at = time.monotonic()
+                # once playback starts, we're no longer "idle"
+                self._playback_idle.clear()
+
+        # ---------- 2) Playback: dequeue with small timeout ----------
         dequeued = False
         try:
-            pcm16 = self._queue.get_nowait()
+            # Small timeout absorbs micro-jitter; tune 0.01–0.03 depending on chunk size
+            pcm16 = await asyncio.wait_for(self._queue.get(), timeout=0.02)
             dequeued = True
-        except asyncio.QueueEmpty:
-            pcm16 = np.zeros(self._chunk_samples, dtype=np.int16)
+            if not isinstance(pcm16, np.ndarray):
+                pcm16 = np.asarray(pcm16, dtype=np.int16)
+            # Ensure correct shape/dtype
+            pcm16 = pcm16.astype(np.int16, copy=False).reshape(-1)
+            if pcm16.shape[0] != chunk_samples:
+                # If a wrong-sized chunk sneaks in, pad/trim rather than exploding
+                if pcm16.shape[0] < chunk_samples:
+                    pcm16 = np.pad(pcm16, (0, chunk_samples - pcm16.shape[0]), mode="constant")
+                else:
+                    pcm16 = pcm16[:chunk_samples]
+        except (asyncio.TimeoutError, asyncio.QueueEmpty):
+            pcm16 = _silence()
 
-        async with self._pending_lock:
-            if self._buffering and self._pending_chunks < self._min_buffered_chunks_for_playback:
-                pcm16 = np.zeros(self._chunk_samples, dtype=np.int16)
-            else:
-                self._buffering = False
+        frame = _make_frame(pcm16)
+        self._next_pts += chunk_samples
 
-        if self._started_at is None:
-            self._started_at = time.monotonic()
-        else:
-            expected_elapsed = self._pts / self._sample_rate
-            wait_s = (self._started_at + expected_elapsed) - time.monotonic()
-            if wait_s > 0:
-                await asyncio.sleep(wait_s)
+        # ---------- 3) Real-time pacing ----------
+        # Keep a stable time base: started_at anchors pts->time
+        self._started_at = time.monotonic()
+        target_t = self._started_at + (frame.pts / sample_rate)
+        wait_s = target_t - time.monotonic()
+        if wait_s > 0:
+            await asyncio.sleep(wait_s)
 
-        frame = AudioFrame.from_ndarray(pcm16.reshape(1, -1), format="s16", layout="mono")
-        frame.sample_rate = self._sample_rate
-        frame.time_base = Fraction(1, self._sample_rate)
-        frame.pts = self._pts
-        self._pts += pcm16.size
-
+        # ---------- 4) Housekeeping (pending + buffering re-entry) ----------
         async with self._pending_lock:
             if dequeued:
-                self._pending_chunks = max(0, self._pending_chunks - 1)
-            if self._pending_chunks == 0:
+                # pending_chunks is optional book-keeping; keep it non-negative
+                self._pending_chunks = max(0, int(self._pending_chunks) - 1)
+
+            # If we've drained the queue, go back to buffering to avoid stutter
+            if self._queue.qsize() == 0:
                 self._buffering = True
                 self._playback_idle.set()
 
         return frame
+
 
     async def push_pcm16(self, audio_pcm16: np.ndarray, sample_rate: int) -> None:
         if audio_pcm16.size == 0:
