@@ -175,6 +175,9 @@ class SmartTurnPipeline:
         self._turn_audio_chunks: deque[np.ndarray] = deque()
         self._turn_audio_samples = 0
         self._in_user_turn = False
+        self._speech_streak = 0
+        self._silence_streak = 0
+        self._start_speech_chunks = 10 
         self._last_speech_ms = 0.0
         self._checked_during_current_silence = False
         self._audio_resampler = AudioResampler(format="s16", layout="mono", rate=TARGET_SAMPLE_RATE)
@@ -272,9 +275,20 @@ class SmartTurnPipeline:
         speaking = self._is_speech(frame_16k)
 
         if speaking:
+            self._speech_streak += 1
+            self._silence_streak = 0
+        else:
+            self._silence_streak += 1
+            self._speech_streak = 0
+
+        if not self._in_user_turn and self._speech_streak >= self._start_speech_chunks:
             self._in_user_turn = True
             self._last_speech_ms = now_ms
             self._checked_during_current_silence = False
+
+        if speaking and self._in_user_turn:
+            self._last_speech_ms = now_ms
+
         if self._in_user_turn and frame_16k.size:
             self._append_turn_frame(frame_16k)
 
@@ -288,17 +302,16 @@ class SmartTurnPipeline:
 
             if self._checked_during_current_silence:
                 return None
-
-            segment_duration_s = self._audio_context_samples / TARGET_SAMPLE_RATE
-            min_segment_duration_s = max(0.0, self._cfg.smart_turn_min_segment_seconds)
-            if segment_duration_s < min_segment_duration_s:
+            
+            turn_duration_s = self._turn_audio_samples / TARGET_SAMPLE_RATE
+            min_turn_s = max(0.0, self._cfg.smart_turn_min_segment_seconds)
+            if turn_duration_s < min_turn_s:
                 logger.info(
-                    "[ceo] smart-turn rimandato: contesto=%.2fs < minimo=%.2fs",
-                    segment_duration_s,
-                    min_segment_duration_s,
+                    "[ceo] smart-turn rimandato: turno=%.2fs < minimo=%.2fs",
+                    turn_duration_s,
+                    min_turn_s,
                 )
                 return None
-
             self._checked_during_current_silence = True
             audio_context = self._build_audio_context()
             result = self._model.predict_endpoint(
