@@ -57,13 +57,11 @@ class CeoConfig(ErmeteConfig):
     debug_heartbeat_ms: int = int(os.getenv("CEO_DEBUG_HEARTBEAT_MS", "2000"))
     tts_model: str = os.getenv(
         "CEO_TTS_MODEL",
-        "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
+        "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
     )
     tts_language: str = os.getenv("CEO_TTS_LANGUAGE", "Italian")
-    tts_instruct: str = os.getenv(
-        "CEO_TTS_INSTRUCT",
-        "Una voce femminile adulta, calda e naturale, con tono colloquiale e ritmo medio.",
-    )
+    tts_ref_audio: str = os.getenv("CEO_TTS_REF_AUDIO", "")
+    tts_ref_text: str = os.getenv("CEO_TTS_REF_TEXT", "")
     tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.04"))
     speaker_embedding_threshold: float = float(os.getenv("CEO_SPEAKER_EMBEDDING_THRESHOLD", "0.8"))
     speaker_embeddings_dir: str = os.getenv("CEO_SPEAKER_EMBEDDINGS_DIR", "./ceo_speakers")
@@ -859,20 +857,29 @@ class TtsPipeline:
     def __init__(self, cfg: CeoConfig):
         self._cfg = cfg
         self._model = load_tts(cfg.tts_model)
+        self._ref_audio_path = Path(cfg.tts_ref_audio).expanduser() if cfg.tts_ref_audio.strip() else None
+        self._ref_text = cfg.tts_ref_text.strip()
+        if self._ref_audio_path is None or not self._ref_text:
+            raise ValueError(
+                "Voice cloning richiede CEO_TTS_REF_AUDIO e CEO_TTS_REF_TEXT valorizzati. "
+                "Configura un file wav di riferimento e la sua trascrizione."
+            )
+        if not self._ref_audio_path.is_file():
+            raise ValueError(f"File reference audio non trovato: {self._ref_audio_path}")
         logger.info("[ceo] TTS attivo (%s, language=%s)", cfg.tts_model, cfg.tts_language)
 
     @property
     def model(self):
         return self._model
 
-    def stream_voice_design_pcm16(self, text: str):
+    def stream_voice_clone_pcm16(self, text: str):
         if not text.strip():
             return
 
-        for result in self._model.generate_voice_design(
+        for result in self._model.generate(
             text=text,
-            language=self._cfg.tts_language,
-            instruct=self._cfg.tts_instruct,
+            ref_audio=str(self._ref_audio_path),
+            ref_text=self._ref_text,
             stream=True,
             streaming_interval=self._cfg.tts_streaming_interval,
         ):
@@ -924,7 +931,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
 
         tts_idle.clear()
         try:
-            stream_iter = iter(tts_pipeline.stream_voice_design_pcm16(text))
+            stream_iter = iter(tts_pipeline.stream_voice_clone_pcm16(text))
             streamed_samples = 0
             tts_sample_rate: int | None = None
             accumulated_chunks: list[np.ndarray] = []
