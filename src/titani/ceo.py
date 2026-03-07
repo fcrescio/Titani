@@ -6,7 +6,6 @@ from collections import deque
 from contextlib import suppress
 from fractions import Fraction
 import os
-import re
 from pathlib import Path
 import time
 import wave
@@ -65,11 +64,6 @@ class CeoConfig(ErmeteConfig):
     tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.04"))
     speaker_embedding_threshold: float = float(os.getenv("CEO_SPEAKER_EMBEDDING_THRESHOLD", "0.8"))
     speaker_embeddings_dir: str = os.getenv("CEO_SPEAKER_EMBEDDINGS_DIR", "./ceo_speakers")
-    speaker_embedding_model: str = os.getenv(
-        "CEO_SPEAKER_EMBEDDING_MODEL",
-        "marksverdhei/Qwen3-Voice-Embedding-12Hz-0.6B",
-    )
-    speaker_embedding_use_tts_fallback: bool = _env_bool("CEO_SPEAKER_EMBEDDING_USE_TTS_FALLBACK", True)
 
 
 class CeoDebug:
@@ -404,7 +398,6 @@ class SpeakerEmbeddingPipeline:
     def __init__(self, cfg: CeoConfig, tts_model):
         self._cfg = cfg
         self._tts_model = tts_model
-        self._speaker_embedding_model = self._load_standalone_speaker_encoder()
         self._target_sample_rate = 24_000
         self._threshold = float(np.clip(cfg.speaker_embedding_threshold, 0.0, 1.0))
         self._embeddings_dir = Path(cfg.speaker_embeddings_dir)
@@ -417,185 +410,9 @@ class SpeakerEmbeddingPipeline:
             self._threshold,
         )
 
-    def _load_standalone_speaker_encoder(self):
-        model_name = self._cfg.speaker_embedding_model.strip()
-        if not model_name:
-            return None
-
-        try:
-            import mlx.core as mx
-            from mlx_audio.tts.models.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
-            from mlx_audio.tts.models.qwen3_tts.speaker_encoder import Qwen3TTSSpeakerEncoder
-            from mlx_audio.utils import get_model_path, load_config, load_weights
-
-            model_path = get_model_path(model_name)
-            config = load_config(model_path)
-            cfg_fields = getattr(Qwen3TTSSpeakerEncoderConfig, "__dataclass_fields__", {})
-            root_cfg = {name: config[name] for name in cfg_fields if name in config}
-            speaker_cfg_values = dict(config.get("speaker_encoder_config", {}))
-            if not speaker_cfg_values:
-                speaker_cfg_values = root_cfg
-            else:
-                for name, value in root_cfg.items():
-                    speaker_cfg_values.setdefault(name, value)
-            speaker_cfg = Qwen3TTSSpeakerEncoderConfig(
-                **speaker_cfg_values,
-            )
-            speaker_model = Qwen3TTSSpeakerEncoder(speaker_cfg)
-
-            raw_weights = load_weights(model_path)
-            candidate_weights: list[tuple[str, dict]] = []
-            seen_signatures: set[tuple[str, ...]] = set()
-
-            def _register_candidate(tag: str, values: dict):
-                if not values:
-                    return
-                signature = tuple(sorted(values.keys()))
-                if signature in seen_signatures:
-                    return
-                seen_signatures.add(signature)
-                candidate_weights.append((tag, values))
-
-            def _swap_conv_weight_layout(weights: dict):
-                swapped: dict = {}
-                swapped_count = 0
-                for key, value in weights.items():
-                    if key.endswith("conv.weight") and hasattr(value, "shape") and len(value.shape) == 3:
-                        swapped[key] = mx.transpose(value, (0, 2, 1))
-                        swapped_count += 1
-                    else:
-                        swapped[key] = value
-                return swapped, swapped_count
-
-            _register_candidate("sanitize", Qwen3TTSSpeakerEncoder.sanitize(dict(raw_weights)))
-            _register_candidate("raw", dict(raw_weights))
-            raw_swapped, raw_swapped_count = _swap_conv_weight_layout(dict(raw_weights))
-            if raw_swapped_count:
-                _register_candidate(f"raw:swap-conv-layout({raw_swapped_count})", raw_swapped)
-
-            for prefix in (
-                "speaker_encoder.",
-                "model.speaker_encoder.",
-                "module.speaker_encoder.",
-                "encoder.",
-                "model.encoder.",
-                "module.encoder.",
-            ):
-                trimmed = {
-                    key[len(prefix) :]: value
-                    for key, value in raw_weights.items()
-                    if key.startswith(prefix)
-                }
-                _register_candidate(f"trim:{prefix}", trimmed)
-                trimmed_swapped, trimmed_swapped_count = _swap_conv_weight_layout(trimmed)
-                if trimmed_swapped_count:
-                    _register_candidate(
-                        f"trim:{prefix}:swap-conv-layout({trimmed_swapped_count})",
-                        trimmed_swapped,
-                    )
-
-            def _looks_like_conv_layout_mismatch(error: ValueError) -> bool:
-                message = str(error)
-                if "conv.weight" not in message:
-                    return False
-                if "Expected shape" not in message or "received shape" not in message:
-                    return False
-                shape_match = re.search(r"Expected shape \(([^)]+)\) but received shape \(([^)]+)\)", message)
-                if shape_match is None:
-                    return False
-                expected = tuple(part.strip() for part in shape_match.group(1).split(",") if part.strip())
-                received = tuple(part.strip() for part in shape_match.group(2).split(",") if part.strip())
-                return len(expected) == 3 and len(received) == 3 and expected == (received[0], received[2], received[1])
-
-            attempted_tags: list[str] = []
-            strict_failures: list[tuple[str, str]] = []
-            selected_strategy: str | None = None
-            selected_strict = True
-            for tag, weights in candidate_weights:
-                attempted_tags.append(tag)
-                try:
-                    speaker_model.load_weights(list(weights.items()), strict=True)
-                    selected_strategy = tag
-                    break
-                except ValueError as exc:
-                    strict_failures.append((tag, str(exc)))
-                    if _looks_like_conv_layout_mismatch(exc):
-                        swapped_weights, swapped_count = _swap_conv_weight_layout(weights)
-                        if swapped_count:
-                            swapped_tag = f"{tag}:auto-swap-conv-layout({swapped_count})"
-                            attempted_tags.append(swapped_tag)
-                            try:
-                                speaker_model.load_weights(list(swapped_weights.items()), strict=True)
-                                selected_strategy = swapped_tag
-                                logger.info(
-                                    "[ceo] speaker encoder strict auto-fix layout (%s, strategy=%s)",
-                                    model_name,
-                                    swapped_tag,
-                                )
-                                break
-                            except ValueError as swapped_exc:
-                                strict_failures.append((swapped_tag, str(swapped_exc)))
-                    logger.debug(
-                        "[ceo] speaker encoder strict load fallito (%s, strategy=%s): %s",
-                        model_name,
-                        tag,
-                        exc,
-                    )
-
-            if selected_strategy is None:
-                if not candidate_weights:
-                    raise ValueError("nessun set di pesi valido trovato nel checkpoint")
-                tag, weights = candidate_weights[-1]
-                attempted_tags.append(f"{tag}:strict=False")
-                speaker_model.load_weights(list(weights.items()), strict=False)
-                selected_strategy = tag
-                selected_strict = False
-
-            log_level = logger.info if selected_strict else logger.warning
-            log_level(
-                "[ceo] speaker encoder dedicato caricato (%s, strategy=%s, strict=%s, attempted=%s)",
-                model_name,
-                selected_strategy,
-                selected_strict,
-                ",".join(attempted_tags),
-            )
-            if strict_failures:
-                logger.info(
-                    "[ceo] speaker encoder strict fallback riuscito (%s, tentativi_falliti=%s)",
-                    model_name,
-                    ",".join(tag for tag, _ in strict_failures),
-                )
-
-            mx.eval(speaker_model.parameters())
-            speaker_model.eval()
-            return speaker_model
-        except Exception:
-            logger.exception("[ceo] caricamento speaker encoder dedicato fallito (%s)", model_name)
-            return None
-
     def _extract_embedding(self, audio_16k: np.ndarray) -> np.ndarray:
-        if self._speaker_embedding_model is not None:
-            import mlx.core as mx
-            from mlx_audio.tts.models.qwen3_tts.qwen3_tts import mel_spectrogram
-
-            audio_24k = _resample_float32(audio_16k, src_rate=TARGET_SAMPLE_RATE, dst_rate=self._target_sample_rate)
-            mels = mel_spectrogram(
-                mx.array(audio_24k),
-                n_fft=1024,
-                num_mels=128,
-                sample_rate=self._target_sample_rate,
-                hop_size=256,
-                win_size=1024,
-                fmin=0,
-                fmax=12_000,
-            )
-            embedding = self._speaker_embedding_model(mels)
-        elif self._cfg.speaker_embedding_use_tts_fallback:
-            audio_24k = _resample_float32(audio_16k, src_rate=TARGET_SAMPLE_RATE, dst_rate=self._target_sample_rate)
-            embedding = self._tts_model.extract_speaker_embedding(audio_24k, sr=self._target_sample_rate)
-        else:
-            raise RuntimeError("speaker encoder non disponibile e fallback TTS disattivato")
-
+        audio_24k = _resample_float32(audio_16k, src_rate=TARGET_SAMPLE_RATE, dst_rate=self._target_sample_rate)
+        embedding = self._tts_model.extract_speaker_embedding(audio_24k, sr=self._target_sample_rate)
         if hasattr(embedding, "tolist"):
             embedding_np = np.asarray(embedding.tolist(), dtype=np.float32)
         else:
