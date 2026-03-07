@@ -65,6 +65,7 @@ class CeoConfig(ErmeteConfig):
     tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.04"))
     speaker_embedding_threshold: float = float(os.getenv("CEO_SPEAKER_EMBEDDING_THRESHOLD", "0.8"))
     speaker_embeddings_dir: str = os.getenv("CEO_SPEAKER_EMBEDDINGS_DIR", "./ceo_speakers")
+    require_known_speaker_for_transcript: bool = _env_bool("CEO_REQUIRE_KNOWN_SPEAKER_FOR_TRANSCRIPT", False)
 
 
 class CeoDebug:
@@ -411,6 +412,23 @@ class SpeakerEmbeddingPipeline:
             self._threshold,
         )
 
+    def _load_known_embeddings(self) -> list[tuple[str, np.ndarray]]:
+        known_embeddings: list[tuple[str, np.ndarray]] = []
+        for embedding_path in sorted(self._embeddings_dir.glob("*.npy")):
+            try:
+                embedding = np.load(embedding_path)
+            except Exception:
+                logger.exception("[ceo] impossibile caricare embedding speaker noto da %s", embedding_path)
+                continue
+
+            embedding_np = np.ascontiguousarray(np.asarray(embedding, dtype=np.float32).reshape(-1), dtype=np.float32)
+            if embedding_np.size == 0:
+                logger.warning("[ceo] embedding speaker noto vuoto ignorato: %s", embedding_path)
+                continue
+
+            known_embeddings.append((embedding_path.stem, embedding_np))
+        return known_embeddings
+
     def _extract_embedding(self, audio_16k: np.ndarray) -> np.ndarray:
         audio_24k = _resample_float32(audio_16k, src_rate=TARGET_SAMPLE_RATE, dst_rate=self._target_sample_rate)
         audio_mx = mx.array(np.ascontiguousarray(audio_24k, dtype=np.float32))
@@ -466,6 +484,51 @@ class SpeakerEmbeddingPipeline:
         self._last_embedding = current_embedding
         self._last_embedding_id = embedding_id
         logger.info("[ceo] nuovo speaker embedding salvato: %s", embedding_path)
+
+    def recognize_known_speaker(self, audio_16k: np.ndarray) -> tuple[bool, str | None, float]:
+        if audio_16k.size == 0:
+            logger.info("[ceo][speaker-guard] segmento vuoto: speaker non riconosciuto")
+            return False, None, 0.0
+
+        try:
+            current_embedding = self._extract_embedding(audio_16k)
+        except Exception:
+            logger.exception("[ceo][speaker-guard] estrazione embedding fallita")
+            return False, None, 0.0
+
+        known_embeddings = self._load_known_embeddings()
+        if not known_embeddings:
+            logger.info(
+                "[ceo][speaker-guard] nessuno speaker noto disponibile in %s",
+                self._embeddings_dir.resolve(),
+            )
+            return False, None, 0.0
+
+        best_id: str | None = None
+        best_probability = 0.0
+        for speaker_id, known_embedding in known_embeddings:
+            similarity = _cosine_similarity(known_embedding, current_embedding)
+            probability_same_speaker = max(0.0, min(1.0, (similarity + 1.0) / 2.0))
+            if probability_same_speaker > best_probability:
+                best_probability = probability_same_speaker
+                best_id = speaker_id
+
+        recognized = best_probability >= self._threshold
+        if recognized:
+            logger.info(
+                "[ceo][speaker-guard] speaker riconosciuto: id=%s prob=%.4f threshold=%.3f",
+                best_id,
+                best_probability,
+                self._threshold,
+            )
+        else:
+            logger.info(
+                "[ceo][speaker-guard] speaker NON riconosciuto: best_id=%s prob=%.4f threshold=%.3f",
+                best_id,
+                best_probability,
+                self._threshold,
+            )
+        return recognized, best_id, best_probability
 
 
 class TtsOutboundAudioTrack(MediaStreamTrack):
@@ -718,6 +781,10 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     asr_pipeline = AsrPipeline(cfg)
     tts_pipeline = TtsPipeline(cfg)
     speaker_pipeline = SpeakerEmbeddingPipeline(cfg, tts_pipeline.model)
+    if cfg.require_known_speaker_for_transcript:
+        logger.info("[ceo][speaker-guard] modalità riconoscimento speaker nota ATTIVA")
+    else:
+        logger.info("[ceo][speaker-guard] modalità riconoscimento speaker nota DISATTIVATA")
     outbound_track = TtsOutboundAudioTrack()
     pc.addTrack(outbound_track)
     logger.info("[webrtc] traccia audio outbound TTS aggiunta")
@@ -830,6 +897,23 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                     if completed_audio is not None:
                         debug.save_segment_for_asr(completed_audio)
                         transcript = await asyncio.to_thread(asr_pipeline.transcribe, completed_audio)
+                        if cfg.require_known_speaker_for_transcript and transcript:
+                            recognized, speaker_id, probability = await asyncio.to_thread(
+                                speaker_pipeline.recognize_known_speaker,
+                                completed_audio,
+                            )
+                            if not recognized:
+                                logger.info(
+                                    "[ceo][speaker-guard] trascrizione scartata: speaker sconosciuto (best_id=%s prob=%.4f)",
+                                    speaker_id,
+                                    probability,
+                                )
+                                continue
+                            logger.info(
+                                "[ceo][speaker-guard] trascrizione autorizzata per speaker noto id=%s (prob=%.4f)",
+                                speaker_id,
+                                probability,
+                            )
                         if transcript:
                             await asyncio.to_thread(speaker_pipeline.process_transcribed_segment, completed_audio)
                         message = {
