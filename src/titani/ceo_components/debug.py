@@ -83,6 +83,7 @@ class CeoDebug:
         speaking: bool,
         speech_subchunks: int,
         total_subchunks: int,
+        required_subchunks: int,
         speech_ratio: float,
         threshold_ratio: float,
         rms: float,
@@ -102,12 +103,13 @@ class CeoDebug:
             return
 
         logger.info(
-            "[ceo][debug][vad] i=%s state=%s speaking=%s sub=%s/%s ratio=%.2f>=%.2f rms=%.5f>=%.5f peak=%.5f streak(s=%s,si=%s) turn=%.2fs silence=%.1fms",
+            "[ceo][debug][vad] i=%s state=%s speaking=%s sub=%s/%s (required=%s) ratio=%.2f>=%.2f rms=%.5f>=%.5f peak=%.5f streak(s=%s,si=%s) turn=%.2fs silence=%.1fms",
             self._vad_trace_count,
             state,
             speaking,
             speech_subchunks,
             total_subchunks,
+            required_subchunks,
             speech_ratio,
             threshold_ratio,
             rms,
@@ -127,6 +129,7 @@ class CeoDebug:
                 "speaking": speaking,
                 "speech_subchunks": speech_subchunks,
                 "total_subchunks": total_subchunks,
+                "required_subchunks": required_subchunks,
                 "speech_ratio": speech_ratio,
                 "threshold_ratio": threshold_ratio,
                 "rms": rms,

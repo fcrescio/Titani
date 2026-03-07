@@ -56,6 +56,7 @@ class SmartTurnPipeline:
         self._last_vad_stats = {
             "speech_subchunks": 0,
             "total_subchunks": 0,
+            "required_subchunks": 0,
             "speech_ratio": 0.0,
             "rms": 0.0,
             "peak": 0.0,
@@ -209,6 +210,7 @@ class SmartTurnPipeline:
             self._last_vad_stats = {
                 "speech_subchunks": 0,
                 "total_subchunks": 0,
+                "required_subchunks": 0,
                 "speech_ratio": 0.0,
                 "rms": float(np.sqrt(np.mean(np.square(frame_16k)))) if frame_16k.size else 0.0,
                 "peak": float(np.max(np.abs(frame_16k))) if frame_16k.size else 0.0,
@@ -224,6 +226,7 @@ class SmartTurnPipeline:
             self._last_vad_stats = {
                 "speech_subchunks": 0,
                 "total_subchunks": 0,
+                "required_subchunks": 0,
                 "speech_ratio": 0.0,
                 "rms": 0.0,
                 "peak": float(np.max(np.abs(frame_16k))) if frame_16k.size else 0.0,
@@ -243,6 +246,7 @@ class SmartTurnPipeline:
             self._last_vad_stats = {
                 "speech_subchunks": 0,
                 "total_subchunks": 0,
+                "required_subchunks": 0,
                 "speech_ratio": 0.0,
                 "rms": 0.0,
                 "peak": float(np.max(np.abs(frame_16k))) if frame_16k.size else 0.0,
@@ -251,19 +255,30 @@ class SmartTurnPipeline:
             return False
 
         speech_ratio = speech_subchunks / total_subchunks
-        min_subchunks = max(1, self._cfg.speech_subchunk_min_count)
-        is_speech_vad = speech_subchunks >= min_subchunks and speech_ratio >= self._cfg.speech_majority_ratio
+        cfg_min_subchunks = max(1, self._cfg.speech_subchunk_min_count)
+        required_subchunks = min(cfg_min_subchunks, total_subchunks)
+        is_speech_vad = speech_subchunks >= required_subchunks and speech_ratio >= self._cfg.speech_majority_ratio
 
         rms = float(np.sqrt(np.mean(np.square(frame_16k)))) if frame_16k.size else 0.0
         peak = float(np.max(np.abs(frame_16k))) if frame_16k.size else 0.0
         self._last_vad_stats = {
             "speech_subchunks": speech_subchunks,
             "total_subchunks": total_subchunks,
+            "required_subchunks": required_subchunks,
             "speech_ratio": speech_ratio,
             "rms": rms,
             "peak": peak,
             "is_speech_vad": is_speech_vad,
         }
+
+        logger.debug(
+            "[ceo][debug][vad] speech_subchunks=%s required_subchunks=%s total_subchunks=%s ratio=%.3f threshold=%.3f",
+            speech_subchunks,
+            required_subchunks,
+            total_subchunks,
+            speech_ratio,
+            self._cfg.speech_majority_ratio,
+        )
 
         if not is_speech_vad:
             return False
@@ -297,6 +312,7 @@ class SmartTurnPipeline:
                 speaking=speaking,
                 speech_subchunks=int(self._last_vad_stats.get("speech_subchunks", 0)),
                 total_subchunks=int(self._last_vad_stats.get("total_subchunks", 0)),
+                required_subchunks=int(self._last_vad_stats.get("required_subchunks", 0)),
                 speech_ratio=float(self._last_vad_stats.get("speech_ratio", 0.0)),
                 threshold_ratio=self._cfg.speech_majority_ratio,
                 rms=float(self._last_vad_stats.get("rms", 0.0)),
