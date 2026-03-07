@@ -41,6 +41,9 @@ class CeoConfig(ErmeteConfig):
     debug_mode: bool = _env_bool("CEO_DEBUG_MODE", False)
     debug_out_dir: str = os.getenv("CEO_DEBUG_OUT_DIR", "./ceo_debug")
     debug_heartbeat_ms: int = int(os.getenv("CEO_DEBUG_HEARTBEAT_MS", "2000"))
+    debug_vad_trace: bool = _env_bool("CEO_DEBUG_VAD_TRACE", False)
+    debug_vad_trace_every_chunks: int = int(os.getenv("CEO_DEBUG_VAD_TRACE_EVERY_CHUNKS", "25"))
+    debug_vad_trace_jsonl: bool = _env_bool("CEO_DEBUG_VAD_TRACE_JSONL", False)
     tts_model: str = os.getenv(
         "CEO_TTS_MODEL",
         "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",

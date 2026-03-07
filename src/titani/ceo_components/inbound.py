@@ -53,6 +53,14 @@ class SmartTurnPipeline:
         if self._debug_dump_wav_enabled:
             self._debug_dump_wav_dir.mkdir(parents=True, exist_ok=True)
         self._audio_resampler = AudioResampler(format="s16", layout="mono", rate=TARGET_SAMPLE_RATE)
+        self._last_vad_stats = {
+            "speech_subchunks": 0,
+            "total_subchunks": 0,
+            "speech_ratio": 0.0,
+            "rms": 0.0,
+            "peak": 0.0,
+            "is_speech_vad": False,
+        }
         logger.info("[ceo] Smart Turn v3 attivo (mlx-community/smart-turn-v3)")
 
     def _transition_to(self, new_state: "_TurnState", reason: str, now_ms: float) -> None:
@@ -198,6 +206,14 @@ class SmartTurnPipeline:
 
     def _is_speech(self, frame_16k: np.ndarray) -> bool:
         if frame_16k.size < WEBRTC_CHUNK_SAMPLES:
+            self._last_vad_stats = {
+                "speech_subchunks": 0,
+                "total_subchunks": 0,
+                "speech_ratio": 0.0,
+                "rms": float(np.sqrt(np.mean(np.square(frame_16k)))) if frame_16k.size else 0.0,
+                "peak": float(np.max(np.abs(frame_16k))) if frame_16k.size else 0.0,
+                "is_speech_vad": False,
+            }
             return False
 
         clipped = np.clip(frame_16k, -1.0, 1.0)
@@ -205,6 +221,14 @@ class SmartTurnPipeline:
 
         usable = (pcm16.size // WEBRTC_CHUNK_SAMPLES) * WEBRTC_CHUNK_SAMPLES
         if usable == 0:
+            self._last_vad_stats = {
+                "speech_subchunks": 0,
+                "total_subchunks": 0,
+                "speech_ratio": 0.0,
+                "rms": 0.0,
+                "peak": float(np.max(np.abs(frame_16k))) if frame_16k.size else 0.0,
+                "is_speech_vad": False,
+            }
             return False
 
         total_subchunks = 0
@@ -216,11 +240,30 @@ class SmartTurnPipeline:
                 speech_subchunks += 1
 
         if total_subchunks == 0:
+            self._last_vad_stats = {
+                "speech_subchunks": 0,
+                "total_subchunks": 0,
+                "speech_ratio": 0.0,
+                "rms": 0.0,
+                "peak": float(np.max(np.abs(frame_16k))) if frame_16k.size else 0.0,
+                "is_speech_vad": False,
+            }
             return False
 
         speech_ratio = speech_subchunks / total_subchunks
         min_subchunks = max(1, self._cfg.speech_subchunk_min_count)
         is_speech_vad = speech_subchunks >= min_subchunks and speech_ratio >= self._cfg.speech_majority_ratio
+
+        rms = float(np.sqrt(np.mean(np.square(frame_16k)))) if frame_16k.size else 0.0
+        peak = float(np.max(np.abs(frame_16k))) if frame_16k.size else 0.0
+        self._last_vad_stats = {
+            "speech_subchunks": speech_subchunks,
+            "total_subchunks": total_subchunks,
+            "speech_ratio": speech_ratio,
+            "rms": rms,
+            "peak": peak,
+            "is_speech_vad": is_speech_vad,
+        }
 
         if not is_speech_vad:
             return False
@@ -228,7 +271,6 @@ class SmartTurnPipeline:
         if self._cfg.vad_min_rms <= 0.0:
             return True
 
-        rms = float(np.sqrt(np.mean(np.square(frame_16k))))
         return rms >= self._cfg.vad_min_rms
 
     def process(self, frame: AudioFrame) -> np.ndarray | None:
@@ -247,6 +289,24 @@ class SmartTurnPipeline:
         else:
             self._silence_streak += 1
             self._speech_streak = 0
+
+        if self._debug is not None:
+            silence_ms = max(0.0, now_ms - self._last_speech_ms) if self._last_speech_ms > 0 else 0.0
+            self._debug.trace_vad_frame(
+                state=self._state.value,
+                speaking=speaking,
+                speech_subchunks=int(self._last_vad_stats.get("speech_subchunks", 0)),
+                total_subchunks=int(self._last_vad_stats.get("total_subchunks", 0)),
+                speech_ratio=float(self._last_vad_stats.get("speech_ratio", 0.0)),
+                threshold_ratio=self._cfg.speech_majority_ratio,
+                rms=float(self._last_vad_stats.get("rms", 0.0)),
+                peak=float(self._last_vad_stats.get("peak", 0.0)),
+                rms_threshold=self._cfg.vad_min_rms,
+                speech_streak=self._speech_streak,
+                silence_streak=self._silence_streak,
+                turn_seconds=self._turn_audio_samples / TARGET_SAMPLE_RATE,
+                silence_ms=silence_ms,
+            )
 
         if self._state == _TurnState.IDLE and speaking:
             self._transition_to(_TurnState.PRE_SPEECH, reason="speech-detected", now_ms=now_ms)
