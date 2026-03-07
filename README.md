@@ -40,8 +40,18 @@ Solo **Teia**:
 
 Solo **Ceo**:
 
-- `CEO_SILENCE_MS_BEFORE_ENDPOINT` (default: `300`, millisecondi di silenzio prima di interrogare Smart Turn)
+- `CEO_PRE_ROLL_MS` (default: `250`, audio pre-roll in millisecondi incluso all'inizio turno)
+- `CEO_START_SPEECH_CHUNKS` (default: `10`, frame consecutivi speech richiesti per avviare un turno)
+- `CEO_SPEECH_MAJORITY_RATIO` (default: `0.5`, quota minima di subchunk speech per considerare un frame parlato)
+- `CEO_SPEECH_SUBCHUNK_MIN_COUNT` (default: `2`, minimo assoluto di subchunk speech per frame)
+- `CEO_VAD_MIN_RMS` (default: `0.0`, soglia RMS minima opzionale per ridurre falsi positivi VAD)
+- `CEO_SILENCE_MS_BEFORE_ENDPOINT` (default: `300`, millisecondi di silenzio prima di entrare in endpoint candidate)
+- `CEO_ENDPOINT_RETRY_MS` (default: `150`, intervallo di retry di `predict_endpoint` durante silenzio)
+- `CEO_MAX_SILENCE_MS_FORCE_COMMIT` (default: `1500`, timeout hard di silenzio continuo per chiudere turno)
+- `CEO_TRAILING_SILENCE_PAD_MS` (default: `200`, pad massimo di silenzio finale incluso nel segmento)
 - `CEO_SMART_TURN_THRESHOLD` (default: `0.5`, soglia per `predict_endpoint`)
+- `CEO_DEBUG_DUMP_WAV_ENABLED` (default: `false`, abilita dump WAV debug dei turni smart-turn committati)
+- `CEO_DEBUG_DUMP_WAV_DIR` (default: `./ceo_debug/smart_turn`, directory dei dump WAV smart-turn)
 - `CEO_ASR_MODEL` (default: `mlx-community/Qwen3-ASR-0.6B-8bit`)
 - `CEO_ASR_LANGUAGE` (default: `Italian`)
 - `CEO_DEBUG_MODE` (default: `false`, abilita heartbeat audio e dump segmenti per debug)
