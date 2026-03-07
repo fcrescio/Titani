@@ -53,6 +53,8 @@ class SmartTurnPipeline:
         if self._debug_dump_wav_enabled:
             self._debug_dump_wav_dir.mkdir(parents=True, exist_ok=True)
         self._audio_resampler = AudioResampler(format="s16", layout="mono", rate=TARGET_SAMPLE_RATE)
+        self._pending_input_frames_16k: list[np.ndarray] = []
+        self._pending_input_frames_target = 3
         self._last_vad_stats = {
             "speech_subchunks": 0,
             "total_subchunks": 0,
@@ -203,7 +205,17 @@ class SmartTurnPipeline:
             mono = pcm.reshape(-1) if pcm.ndim > 1 else pcm
             chunks.append(mono.astype(np.float32, copy=False) / 32768.0)
 
-        return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        mono_16k = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        if mono_16k.size == 0:
+            return mono_16k
+
+        self._pending_input_frames_16k.append(np.ascontiguousarray(mono_16k))
+        if len(self._pending_input_frames_16k) < self._pending_input_frames_target:
+            return np.zeros(0, dtype=np.float32)
+
+        merged = np.concatenate(self._pending_input_frames_16k)
+        self._pending_input_frames_16k.clear()
+        return np.ascontiguousarray(merged, dtype=np.float32)
 
     def _is_speech(self, frame_16k: np.ndarray) -> bool:
         if frame_16k.size < WEBRTC_CHUNK_SAMPLES:
@@ -411,6 +423,7 @@ class SmartTurnPipeline:
         self._pre_roll_samples = 0
         self._turn_audio_chunks.clear()
         self._turn_audio_samples = 0
+        self._pending_input_frames_16k.clear()
         self._state = _TurnState.IDLE
         self._last_speech_ms = 0.0
         self._speech_streak = 0
