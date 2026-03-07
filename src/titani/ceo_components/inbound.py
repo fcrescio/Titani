@@ -14,25 +14,21 @@ import webrtcvad
 from aiortc.mediastreams import AudioFrame
 from av.audio.resampler import AudioResampler
 from mlx_audio.stt.utils import load_model as load_stt
-from mlx_audio.vad.utils import load_model as load_vad
 
 from .audio_utils import cosine_similarity, resample_float32
-from .config import MAX_CONTEXT_SAMPLES, TARGET_SAMPLE_RATE, WEBRTC_CHUNK_SAMPLES, CeoConfig
+from .config import TARGET_SAMPLE_RATE, WEBRTC_CHUNK_SAMPLES, CeoConfig
 from .debug import CeoDebug
 
 logger = logging.getLogger(__name__)
 
 
 class SmartTurnPipeline:
-    """Smart Turn v3 endpoint detection with 8s rolling context."""
+    """Simple VAD + silence-based turn segmentation for ASR."""
 
     def __init__(self, cfg: CeoConfig, debug: CeoDebug | None = None):
         self._cfg = cfg
         self._debug = debug
         self._vad = webrtcvad.Vad(2)
-        self._model = load_vad("mlx-community/smart-turn-v3", strict=True)
-        self._audio_context_chunks: deque[np.ndarray] = deque()
-        self._audio_context_samples = 0
         self._pre_roll_chunks: deque[np.ndarray] = deque()
         self._pre_roll_samples = 0
         self._pre_roll_max_samples = max(0, TARGET_SAMPLE_RATE * max(0, cfg.pre_roll_ms) // 1000)
@@ -42,9 +38,9 @@ class SmartTurnPipeline:
         self._speech_streak = 0
         self._silence_streak = 0
         self._start_speech_chunks = max(1, cfg.start_speech_chunks)
+        self._min_turn_samples = int(max(0.0, cfg.smart_turn_min_segment_seconds) * TARGET_SAMPLE_RATE)
         self._last_speech_ms = 0.0
         self._silence_started_ms: float | None = None
-        self._last_endpoint_check_ms: float | None = None
         self._end_candidate_silence_samples = 0
         self._session_id = uuid4().hex[:8]
         self._turn_id = 0
@@ -64,7 +60,7 @@ class SmartTurnPipeline:
             "peak": 0.0,
             "is_speech_vad": False,
         }
-        logger.info("[ceo] Smart Turn v3 attivo (mlx-community/smart-turn-v3)")
+        logger.info("[ceo] inbound VAD semplice attivo (start=%s chunk, silence_end=%sms)", self._start_speech_chunks, cfg.silence_ms_before_endpoint)
 
     def _transition_to(self, new_state: "_TurnState", reason: str, now_ms: float) -> None:
         if self._state == new_state:
@@ -81,32 +77,6 @@ class SmartTurnPipeline:
             silence_ms,
         )
         self._state = new_state
-
-    def _append_context_frame(self, frame_16k: np.ndarray) -> None:
-        if frame_16k.size == 0:
-            return
-
-        if frame_16k.size >= MAX_CONTEXT_SAMPLES:
-            self._audio_context_chunks.clear()
-            self._audio_context_chunks.append(np.ascontiguousarray(frame_16k[-MAX_CONTEXT_SAMPLES:]))
-            self._audio_context_samples = int(self._audio_context_chunks[0].size)
-            return
-
-        frame_chunk = np.ascontiguousarray(frame_16k)
-        self._audio_context_chunks.append(frame_chunk)
-        self._audio_context_samples += int(frame_chunk.size)
-
-        while self._audio_context_samples > MAX_CONTEXT_SAMPLES and self._audio_context_chunks:
-            overflow = self._audio_context_samples - MAX_CONTEXT_SAMPLES
-            oldest = self._audio_context_chunks[0]
-
-            if oldest.size <= overflow:
-                self._audio_context_chunks.popleft()
-                self._audio_context_samples -= int(oldest.size)
-                continue
-
-            self._audio_context_chunks[0] = oldest[overflow:]
-            self._audio_context_samples -= overflow
 
     def _append_turn_frame(self, frame_16k: np.ndarray) -> None:
         if frame_16k.size == 0:
@@ -145,7 +115,6 @@ class SmartTurnPipeline:
         self._silence_streak = 0
         self._last_speech_ms = 0.0
         self._silence_started_ms = None
-        self._last_endpoint_check_ms = None
         self._end_candidate_silence_samples = 0
         self._transition_to(_TurnState.IDLE, reason="clear-turn-state", now_ms=time.monotonic() * 1000.0)
 
@@ -154,7 +123,7 @@ class SmartTurnPipeline:
             return
 
         ts_ms = int(time.time() * 1000)
-        out_path = self._debug_dump_wav_dir / f"smart_turn_{self._session_id}_turn{self._turn_id:04d}_{reason}_{ts_ms}.wav"
+        out_path = self._debug_dump_wav_dir / f"inbound_{self._session_id}_turn{self._turn_id:04d}_{reason}_{ts_ms}.wav"
         clipped = np.clip(audio_16k, -1.0, 1.0)
         pcm16 = (clipped * 32767.0).astype(np.int16)
         with wave.open(str(out_path), "wb") as wf:
@@ -162,7 +131,7 @@ class SmartTurnPipeline:
             wf.setsampwidth(2)
             wf.setframerate(TARGET_SAMPLE_RATE)
             wf.writeframes(pcm16.tobytes())
-        logger.info("[ceo][debug] smart-turn wav salvato: %s", out_path)
+        logger.info("[ceo][debug] inbound wav salvato: %s", out_path)
 
     def _commit_turn(self, reason: str) -> np.ndarray | None:
         completed_turn = self._drain_turn_audio()
@@ -175,13 +144,6 @@ class SmartTurnPipeline:
         self._save_turn_debug_wav(completed_turn, reason=reason)
         self._clear_turn_only_state()
         return completed_turn
-
-    def _build_audio_context(self) -> np.ndarray:
-        if not self._audio_context_chunks:
-            return np.zeros(0, dtype=np.float32)
-        if len(self._audio_context_chunks) == 1:
-            return self._audio_context_chunks[0]
-        return np.concatenate(self._audio_context_chunks)
 
     def _drain_turn_audio(self) -> np.ndarray:
         if not self._turn_audio_chunks:
@@ -304,7 +266,6 @@ class SmartTurnPipeline:
         frame_16k = self._frame_to_mono_16k(frame)
         if self._debug is not None:
             self._debug.observe_frame(frame.sample_rate, frame_16k)
-        self._append_context_frame(frame_16k)
         self._append_pre_roll_frame(frame_16k)
 
         now_ms = time.monotonic() * 1000.0
@@ -345,7 +306,6 @@ class SmartTurnPipeline:
                 self._seed_turn_audio_with_pre_roll()
                 self._last_speech_ms = now_ms
                 self._silence_started_ms = None
-                self._last_endpoint_check_ms = None
                 self._end_candidate_silence_samples = 0
                 logger.info("[ceo] user turn started (pre-roll=%sms)", self._cfg.pre_roll_ms)
             elif not speaking:
@@ -367,7 +327,6 @@ class SmartTurnPipeline:
             self._silence_started_ms = None
             self._end_candidate_silence_samples = 0
             if self._state == _TurnState.END_CANDIDATE:
-                self._last_endpoint_check_ms = None
                 self._transition_to(_TurnState.IN_TURN, reason="speech-resumed", now_ms=now_ms)
                 logger.info("[ceo] speech resumed during END_CANDIDATE")
 
@@ -384,41 +343,22 @@ class SmartTurnPipeline:
                 if silence_ms >= self._cfg.max_silence_ms_force_commit:
                     logger.info("[ceo] turn closed by hard timeout silence_ms=%.1f", silence_ms)
                     return self._commit_turn(reason="hard-timeout")
-
-                if self._last_endpoint_check_ms is None or now_ms - self._last_endpoint_check_ms >= self._cfg.endpoint_retry_ms:
-                    turn_duration_s = self._turn_audio_samples / TARGET_SAMPLE_RATE
-                    min_turn_s = max(0.0, self._cfg.smart_turn_min_segment_seconds)
-                    self._last_endpoint_check_ms = now_ms
-                    if turn_duration_s < min_turn_s:
+                if silence_ms >= self._cfg.silence_ms_before_endpoint:
+                    if self._turn_audio_samples < self._min_turn_samples:
                         logger.info(
-                            "[ceo] smart-turn rimandato: turno=%.2fs < minimo=%.2fs silence_ms=%.1f",
-                            turn_duration_s,
-                            min_turn_s,
-                            silence_ms,
+                            "[ceo] turno troppo corto (%.2fs < %.2fs), ignoro",
+                            self._turn_audio_samples / TARGET_SAMPLE_RATE,
+                            self._min_turn_samples / TARGET_SAMPLE_RATE,
                         )
+                        self._clear_turn_only_state()
                         return None
 
-                    logger.info("[ceo] predict_endpoint call silence_ms=%.1f", silence_ms)
-                    audio_context = self._build_audio_context()
-                    result = self._model.predict_endpoint(
-                        audio_context,
-                        sample_rate=TARGET_SAMPLE_RATE,
-                        threshold=self._cfg.smart_turn_threshold,
-                    )
-
-                    prediction = int(getattr(result, "prediction", 0))
-                    probability = float(getattr(result, "probability", 0.0))
-                    logger.info("[ceo] smart-turn prediction=%s probability=%.3f", prediction, probability)
-
-                    if prediction == 1:
-                        logger.info("[ceo] turn closed by model")
-                        return self._commit_turn(reason="model-endpoint")
+                    logger.info("[ceo] turn closed by silence silence_ms=%.1f", silence_ms)
+                    return self._commit_turn(reason="silence-endpoint")
 
         return None
 
     def reset_turn_state(self) -> None:
-        self._audio_context_chunks.clear()
-        self._audio_context_samples = 0
         self._pre_roll_chunks.clear()
         self._pre_roll_samples = 0
         self._turn_audio_chunks.clear()
@@ -429,7 +369,6 @@ class SmartTurnPipeline:
         self._speech_streak = 0
         self._silence_streak = 0
         self._silence_started_ms = None
-        self._last_endpoint_check_ms = None
         self._end_candidate_silence_samples = 0
 
 
