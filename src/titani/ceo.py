@@ -16,6 +16,7 @@ from tempfile import NamedTemporaryFile
 import numpy as np
 import webrtcvad
 import websockets
+import mlx.core as mx
 from av.audio.resampler import AudioResampler
 from aiortc import MediaStreamTrack, RTCPeerConnection
 from aiortc.mediastreams import AudioFrame, MediaStreamError
@@ -412,7 +413,8 @@ class SpeakerEmbeddingPipeline:
 
     def _extract_embedding(self, audio_16k: np.ndarray) -> np.ndarray:
         audio_24k = _resample_float32(audio_16k, src_rate=TARGET_SAMPLE_RATE, dst_rate=self._target_sample_rate)
-        embedding = self._tts_model.extract_speaker_embedding(audio_24k, sr=self._target_sample_rate)
+        audio_mx = mx.array(np.ascontiguousarray(audio_24k, dtype=np.float32))
+        embedding = self._tts_model.extract_speaker_embedding(audio_mx, sr=self._target_sample_rate)
         if hasattr(embedding, "tolist"):
             embedding_np = np.asarray(embedding.tolist(), dtype=np.float32)
         else:
