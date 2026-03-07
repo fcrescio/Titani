@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 import wave
@@ -20,9 +21,21 @@ class CeoDebug:
         self._frame_count = 0
         self._received_samples_16k = 0
         self._saved_segments = 0
+        self._vad_trace_enabled = self._enabled and cfg.debug_vad_trace
+        self._vad_trace_every_chunks = max(1, cfg.debug_vad_trace_every_chunks)
+        self._vad_trace_jsonl_enabled = self._vad_trace_enabled and cfg.debug_vad_trace_jsonl
+        self._vad_trace_count = 0
+        self._vad_trace_path = self._out_dir / "vad_trace.jsonl"
         if self._enabled:
             self._out_dir.mkdir(parents=True, exist_ok=True)
             logger.info("[ceo][debug] modalità debug attiva, directory output: %s", self._out_dir.resolve())
+            if self._vad_trace_enabled:
+                logger.info(
+                    "[ceo][debug] VAD trace attivo (every_chunks=%s, jsonl=%s, file=%s)",
+                    self._vad_trace_every_chunks,
+                    self._vad_trace_jsonl_enabled,
+                    self._vad_trace_path,
+                )
 
     @property
     def enabled(self) -> bool:
@@ -62,6 +75,70 @@ class CeoDebug:
             rms,
             peak,
         )
+
+    def trace_vad_frame(
+        self,
+        *,
+        state: str,
+        speaking: bool,
+        speech_subchunks: int,
+        total_subchunks: int,
+        speech_ratio: float,
+        threshold_ratio: float,
+        rms: float,
+        peak: float,
+        rms_threshold: float,
+        speech_streak: int,
+        silence_streak: int,
+        turn_seconds: float,
+        silence_ms: float,
+    ) -> None:
+        if not self._vad_trace_enabled:
+            return
+
+        self._vad_trace_count += 1
+        should_log = speaking or self._vad_trace_count % self._vad_trace_every_chunks == 0
+        if not should_log:
+            return
+
+        logger.info(
+            "[ceo][debug][vad] i=%s state=%s speaking=%s sub=%s/%s ratio=%.2f>=%.2f rms=%.5f>=%.5f peak=%.5f streak(s=%s,si=%s) turn=%.2fs silence=%.1fms",
+            self._vad_trace_count,
+            state,
+            speaking,
+            speech_subchunks,
+            total_subchunks,
+            speech_ratio,
+            threshold_ratio,
+            rms,
+            rms_threshold,
+            peak,
+            speech_streak,
+            silence_streak,
+            turn_seconds,
+            silence_ms,
+        )
+
+        if self._vad_trace_jsonl_enabled:
+            payload = {
+                "ts_ms": int(time.time() * 1000),
+                "i": self._vad_trace_count,
+                "state": state,
+                "speaking": speaking,
+                "speech_subchunks": speech_subchunks,
+                "total_subchunks": total_subchunks,
+                "speech_ratio": speech_ratio,
+                "threshold_ratio": threshold_ratio,
+                "rms": rms,
+                "rms_threshold": rms_threshold,
+                "peak": peak,
+                "speech_streak": speech_streak,
+                "silence_streak": silence_streak,
+                "turn_seconds": turn_seconds,
+                "silence_ms": silence_ms,
+            }
+            with self._vad_trace_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def save_segment_for_asr(self, audio_16k: np.ndarray) -> Path | None:
         if not self._enabled:
