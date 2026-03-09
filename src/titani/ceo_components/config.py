@@ -55,3 +55,7 @@ class CeoConfig(ErmeteConfig):
     speaker_embedding_threshold: float = float(os.getenv("CEO_SPEAKER_EMBEDDING_THRESHOLD", "0.8"))
     speaker_embeddings_dir: str = os.getenv("CEO_SPEAKER_EMBEDDINGS_DIR", "./ceo_speakers")
     require_known_speaker_for_transcript: bool = _env_bool("CEO_REQUIRE_KNOWN_SPEAKER_FOR_TRANSCRIPT", False)
+    say_to_user_queue_maxsize: int = max(1, int(os.getenv("CEO_SAY_TO_USER_QUEUE_MAXSIZE", "32")))
+    say_to_user_queue_overflow_policy: str = os.getenv("CEO_SAY_TO_USER_QUEUE_OVERFLOW_POLICY", "drop_oldest")
+    say_to_user_max_retries: int = max(0, int(os.getenv("CEO_SAY_TO_USER_MAX_RETRIES", "2")))
+    say_to_user_retry_delay_s: float = max(0.0, float(os.getenv("CEO_SAY_TO_USER_RETRY_DELAY_S", "0.1")))
