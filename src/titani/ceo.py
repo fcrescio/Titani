@@ -18,8 +18,10 @@ from titani.ceo_components import (
     TtsPipeline,
 )
 from titani.common import WebRTCCommandChannel, maybe_handle_offer, run, setup_logging
+from titani.say_queue import SayToUserItem, enqueue_say_to_user, handle_say_to_user_retry
 
 logger = logging.getLogger(__name__)
+
 
 
 async def ceo_consumer(cfg: CeoConfig) -> None:
@@ -40,7 +42,8 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     cmd_send_lock = asyncio.Lock()
     tts_idle = asyncio.Event()
     tts_idle.set()
-    say_to_user_queue: asyncio.Queue[str] = asyncio.Queue()
+    overflow_policy = (cfg.say_to_user_queue_overflow_policy or "drop_oldest").strip().lower()
+    say_to_user_queue: asyncio.Queue[SayToUserItem] = asyncio.Queue(maxsize=cfg.say_to_user_queue_maxsize)
     pump_tasks: set[asyncio.Task[None]] = set()
     shutdown_lock = asyncio.Lock()
 
@@ -54,15 +57,21 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     async def on_iceconnectionstatechange() -> None:
         logger.info("[webrtc] ice connection state -> %s", pc.iceConnectionState)
 
-    async def handle_say_to_user_text(text: str) -> None:
+    async def handle_say_to_user_text(item: SayToUserItem) -> bool:
+        text = item.text
         if not text:
-            return
+            return True
 
         logger.info("[ceo] say_to_user ricevuto -> %r", text)
-        ok = await outbound_track.wait_consumer_started(timeout=2.0)
-        if not ok:
-            logger.warning("TTS consumer not started yet; dropping or delaying say_to_user")
-            return
+        ready = await handle_say_to_user_retry(
+            outbound_track=outbound_track,
+            queue=say_to_user_queue,
+            item=item,
+            overflow_policy=overflow_policy,
+            retry_delay_s=cfg.say_to_user_retry_delay_s,
+        )
+        if not ready:
+            return False
 
         tts_idle.clear()
         try:
@@ -86,7 +95,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
 
             if streamed_samples == 0 or tts_sample_rate is None:
                 logger.warning("[ceo] TTS non ha generato audio")
-                return
+                return True
 
             if debug.enabled:
                 full_audio = np.concatenate(accumulated_chunks)
@@ -99,14 +108,15 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                 tts_sample_rate,
                 outbound_track.output_sample_rate,
             )
+            return True
         finally:
             tts_idle.set()
 
     async def say_to_user_worker() -> None:
         while True:
-            text = await say_to_user_queue.get()
+            item = await say_to_user_queue.get()
             try:
-                await handle_say_to_user_text(text)
+                await handle_say_to_user_text(item)
             finally:
                 say_to_user_queue.task_done()
 
@@ -210,7 +220,13 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                         )
                     text = str(data.get("text", "")).strip()
                     if text:
-                        await say_to_user_queue.put(text)
+                        queued = enqueue_say_to_user(
+                            say_to_user_queue,
+                            SayToUserItem(text=text, retries_left=cfg.say_to_user_max_retries),
+                            overflow_policy=overflow_policy,
+                        )
+                        if not queued:
+                            logger.warning("[ceo] say_to_user scartato per overflow queue (policy=%s)", overflow_policy)
                 else:
                     logger.info("[dc] msg: %s", data)
 

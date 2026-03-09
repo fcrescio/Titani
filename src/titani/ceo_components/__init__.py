@@ -6,8 +6,16 @@ from .config import (
     CeoConfig,
 )
 from .debug import CeoDebug
-from .inbound import AsrPipeline, SmartTurnPipeline, SpeakerEmbeddingPipeline
-from .outbound import TtsOutboundAudioTrack, TtsPipeline
+
+try:
+    from .inbound import AsrPipeline, SmartTurnPipeline, SpeakerEmbeddingPipeline
+except ModuleNotFoundError:  # optional runtime deps for CEO mode
+    AsrPipeline = SmartTurnPipeline = SpeakerEmbeddingPipeline = None  # type: ignore[assignment]
+
+try:
+    from .outbound import TtsOutboundAudioTrack, TtsPipeline
+except ModuleNotFoundError:  # optional runtime deps for CEO mode
+    TtsOutboundAudioTrack = TtsPipeline = None  # type: ignore[assignment]
 
 __all__ = [
     "AsrPipeline",
