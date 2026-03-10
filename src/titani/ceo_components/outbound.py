@@ -27,7 +27,7 @@ class TtsPipeline:
             )
         if not self._ref_audio_path.is_file():
             raise ValueError(f"File reference audio non trovato: {self._ref_audio_path}")
-        logger.info("[ceo] TTS attivo (%s, language=%s)", cfg.tts_model, cfg.tts_language)
+        logger.info("[ceo] TTS attivo (%s)", cfg.tts_model)
 
     @property
     def model(self):

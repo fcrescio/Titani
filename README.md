@@ -59,7 +59,7 @@ Solo **Ceo**:
 - `CEO_DEBUG_VAD_TRACE_EVERY_CHUNKS` (default: `25`, ogni quanti chunk forzare un log anche in assenza di speech)
 - `CEO_DEBUG_VAD_TRACE_JSONL` (default: `false`, salva anche trace strutturato in `ceo_debug/vad_trace.jsonl`)
 - `CEO_TTS_MODEL` (default: `mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16`)
-- `CEO_TTS_LANGUAGE` (default: `Italian`)
+- Nota: per il backend TTS corrente (`mlx_audio.tts`) la lingua non è configurabile via `generate()`: eventuali variabili legacy di lingua vengono ignorate con warning esplicito nei log.
 - `CEO_TTS_REF_AUDIO` (default: vuoto, path al file `.wav` di riferimento per il voice cloning)
 - `CEO_TTS_REF_TEXT` (default: vuoto, trascrizione del file audio di riferimento)
 - `CEO_TTS_STREAMING_INTERVAL` (default: `0.32`)

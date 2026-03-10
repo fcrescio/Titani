@@ -1,7 +1,11 @@
+import logging
 import os
 from dataclasses import dataclass
 
 from titani.common import ErmeteConfig
+
+
+logger = logging.getLogger(__name__)
 
 
 TARGET_SAMPLE_RATE = 16_000
@@ -20,6 +24,10 @@ OUTBOUND_HIGH_WATERMARK_MS = max(
     OUTBOUND_LOW_WATERMARK_MS + WEBRTC_CHUNK_MS,
     int(os.getenv("CEO_OUTBOUND_HIGH_WATERMARK_MS", os.getenv("CEO_OUTBOUND_MAX_BUFFER_MS", "400"))),
 )
+
+UNSUPPORTED_NOOP_ENV_VARS: dict[str, str] = {
+    "CEO_TTS_LANGUAGE": "Il backend TTS corrente (mlx_audio.tts) non supporta la selezione lingua in generate().",
+}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -54,7 +62,6 @@ class CeoConfig(ErmeteConfig):
         "CEO_TTS_MODEL",
         "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
     )
-    tts_language: str = os.getenv("CEO_TTS_LANGUAGE", "Italian")
     tts_ref_audio: str = os.getenv("CEO_TTS_REF_AUDIO", "")
     tts_ref_text: str = os.getenv("CEO_TTS_REF_TEXT", "")
     tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.04"))
@@ -65,3 +72,15 @@ class CeoConfig(ErmeteConfig):
     say_to_user_queue_overflow_policy: str = os.getenv("CEO_SAY_TO_USER_QUEUE_OVERFLOW_POLICY", "drop_oldest")
     say_to_user_max_retries: int = max(0, int(os.getenv("CEO_SAY_TO_USER_MAX_RETRIES", "2")))
     say_to_user_retry_delay_s: float = max(0.0, float(os.getenv("CEO_SAY_TO_USER_RETRY_DELAY_S", "0.1")))
+
+    def __post_init__(self) -> None:
+        for env_name, reason in UNSUPPORTED_NOOP_ENV_VARS.items():
+            raw_value = os.getenv(env_name)
+            if raw_value is None:
+                continue
+            logger.warning(
+                "[ceo][config] %s=%r ignorato: %s",
+                env_name,
+                raw_value,
+                reason,
+            )
