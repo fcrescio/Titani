@@ -8,6 +8,7 @@ import unittest
 import numpy as np
 
 from titani.audio_pipeline import TtsOutboundAudioTrack
+from titani.ceo_components.config import WEBRTC_CHUNK_MS, derive_outbound_buffer_watermarks
 
 
 class TestTtsOutboundAudioTrack(unittest.IsolatedAsyncioTestCase):
@@ -34,16 +35,26 @@ class TestTtsOutboundAudioTrack(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chunks[0].shape[0], 160)
         self.assertEqual(chunks[1].shape[0], 160)
 
-    async def test_push_pcm16_enforces_max_buffer(self) -> None:
+    def test_derive_outbound_buffer_watermarks_ratio(self) -> None:
+        low_ms, high_ms = derive_outbound_buffer_watermarks(500)
+
+        self.assertEqual(high_ms, 500)
+        self.assertEqual(low_ms, 200)
+
+    def test_derive_outbound_buffer_watermarks_chunk_clamp(self) -> None:
+        low_ms, high_ms = derive_outbound_buffer_watermarks(WEBRTC_CHUNK_MS)
+
+        self.assertEqual(high_ms, WEBRTC_CHUNK_MS * 2)
+        self.assertEqual(low_ms, WEBRTC_CHUNK_MS)
+
+    async def test_update_buffer_policy_enforces_chunk_clamp(self) -> None:
         track = TtsOutboundAudioTrack()
-        track._max_buffer_ms = 40
-        chunk = np.ones(track._chunk_samples, dtype=np.int16)
-        audio = np.tile(chunk, 10)
 
-        await track.push_pcm16(audio, sample_rate=track.output_sample_rate)
+        snapshot = await track.update_buffer_policy(target_buffer_ms=WEBRTC_CHUNK_MS)
 
-        self.assertLessEqual(track._pending_chunks, 2)
-        self.assertLessEqual(track._queue.qsize(), 2)
+        self.assertEqual(snapshot["target_buffer_ms"], WEBRTC_CHUNK_MS * 2)
+        self.assertEqual(snapshot["high_watermark_ms"], WEBRTC_CHUNK_MS * 2)
+        self.assertEqual(snapshot["low_watermark_ms"], WEBRTC_CHUNK_MS)
 
     async def test_recv_pts_monotonic_and_state_transitions(self) -> None:
         track = TtsOutboundAudioTrack()
