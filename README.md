@@ -46,10 +46,8 @@ Solo **Ceo**:
 - `CEO_SPEECH_SUBCHUNK_MIN_COUNT` (default: `2`, minimo assoluto di subchunk speech per frame)
 - `CEO_VAD_MIN_RMS` (default: `0.0`, soglia RMS minima opzionale per ridurre falsi positivi VAD)
 - `CEO_SILENCE_MS_BEFORE_ENDPOINT` (default: `300`, millisecondi di silenzio prima di entrare in endpoint candidate)
-- `CEO_ENDPOINT_RETRY_MS` (default: `150`, intervallo di retry di `predict_endpoint` durante silenzio)
 - `CEO_MAX_SILENCE_MS_FORCE_COMMIT` (default: `1500`, timeout hard di silenzio continuo per chiudere turno)
 - `CEO_TRAILING_SILENCE_PAD_MS` (default: `200`, pad massimo di silenzio finale incluso nel segmento)
-- `CEO_SMART_TURN_THRESHOLD` (default: `0.5`, soglia per `predict_endpoint`)
 - `CEO_DEBUG_DUMP_WAV_ENABLED` (default: `false`, abilita dump WAV debug dei turni smart-turn committati)
 - `CEO_DEBUG_DUMP_WAV_DIR` (default: `./ceo_debug/smart_turn`, directory dei dump WAV smart-turn)
 - `CEO_ASR_MODEL` (default: `mlx-community/Qwen3-ASR-0.6B-8bit`)
@@ -65,3 +63,7 @@ Solo **Ceo**:
 - `CEO_TTS_REF_AUDIO` (default: vuoto, path al file `.wav` di riferimento per il voice cloning)
 - `CEO_TTS_REF_TEXT` (default: vuoto, trascrizione del file audio di riferimento)
 - `CEO_TTS_STREAMING_INTERVAL` (default: `0.32`)
+
+### Nota migrazione CEO
+
+Dalle versioni precedenti, le variabili `CEO_ENDPOINT_RETRY_MS` e `CEO_SMART_TURN_THRESHOLD` non sono più utilizzate: ora sono deprecate/rimosse e vengono ignorate se ancora presenti nell'ambiente.
