@@ -6,13 +6,13 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import TARGET_SAMPLE_RATE, CeoConfig
+from .config import DebugConfig, TARGET_SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
 
 class CeoDebug:
-    def __init__(self, cfg: CeoConfig):
+    def __init__(self, cfg: DebugConfig):
         self._enabled = cfg.debug_mode
         self._out_dir = Path(cfg.debug_out_dir)
         self._heartbeat_ms = max(250, cfg.debug_heartbeat_ms)

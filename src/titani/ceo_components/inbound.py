@@ -11,7 +11,7 @@ import numpy as np
 from mlx_audio.stt.utils import load_model as load_stt
 
 from .audio_utils import cosine_similarity, resample_float32
-from .config import TARGET_SAMPLE_RATE, CeoConfig
+from .config import AsrConfig, SpeakerConfig, TARGET_SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ from titani.audio_pipeline import SmartTurnPipeline
 
 
 class AsrPipeline:
-    def __init__(self, cfg: CeoConfig):
+    def __init__(self, cfg: AsrConfig):
         self._cfg = cfg
         self._model = load_stt(cfg.asr_model)
         logger.info("[ceo] ASR attivo (%s, language=%s)", cfg.asr_model, cfg.asr_language)
@@ -41,7 +41,7 @@ class AsrPipeline:
 
 
 class SpeakerEmbeddingPipeline:
-    def __init__(self, cfg: CeoConfig, tts_model):
+    def __init__(self, cfg: SpeakerConfig, tts_model):
         self._cfg = cfg
         self._tts_model = tts_model
         self._target_sample_rate = 24_000

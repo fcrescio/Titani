@@ -38,12 +38,12 @@ OUTBOUND_MAX_BUFFER_STEP_MS = 20
 async def ceo_consumer(cfg: CeoConfig) -> None:
     pc = RTCPeerConnection()
     cmd_channel = WebRTCCommandChannel(pc)
-    debug = CeoDebug(cfg)
-    turn_pipeline = SmartTurnPipeline(cfg, debug=debug)
-    asr_pipeline = AsrPipeline(cfg)
-    tts_pipeline = TtsPipeline(cfg)
-    speaker_pipeline = SpeakerEmbeddingPipeline(cfg, tts_pipeline.model)
-    if cfg.require_known_speaker_for_transcript:
+    debug = CeoDebug(cfg.debug)
+    turn_pipeline = SmartTurnPipeline(cfg.ingress, debug=debug)
+    asr_pipeline = AsrPipeline(cfg.asr)
+    tts_pipeline = TtsPipeline(cfg.outbound)
+    speaker_pipeline = SpeakerEmbeddingPipeline(cfg.speaker, tts_pipeline.model)
+    if cfg.speaker.require_known_speaker_for_transcript:
         logger.info("[ceo][speaker-guard] modalità riconoscimento speaker nota ATTIVA")
     else:
         logger.info("[ceo][speaker-guard] modalità riconoscimento speaker nota DISATTIVATA")
@@ -53,8 +53,8 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     cmd_send_lock = asyncio.Lock()
     tts_idle = asyncio.Event()
     tts_idle.set()
-    overflow_policy = (cfg.say_to_user_queue_overflow_policy or "drop_oldest").strip().lower()
-    say_to_user_queue: asyncio.Queue[SayToUserItem] = asyncio.Queue(maxsize=cfg.say_to_user_queue_maxsize)
+    overflow_policy = (cfg.outbound.say_to_user_queue_overflow_policy or "drop_oldest").strip().lower()
+    say_to_user_queue: asyncio.Queue[SayToUserItem] = asyncio.Queue(maxsize=cfg.outbound.say_to_user_queue_maxsize)
     pump_tasks: set[asyncio.Task[None]] = set()
     housekeeping_tasks: set[asyncio.Task[None]] = set()
     shutdown_lock = asyncio.Lock()
@@ -80,7 +80,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
             queue=say_to_user_queue,
             item=item,
             overflow_policy=overflow_policy,
-            retry_delay_s=cfg.say_to_user_retry_delay_s,
+            retry_delay_s=cfg.outbound.say_to_user_retry_delay_s,
         )
         if not ready:
             return False
@@ -256,7 +256,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                     if completed_audio is not None:
                         debug.save_segment_for_asr(completed_audio)
                         transcript = await asyncio.to_thread(asr_pipeline.transcribe, completed_audio)
-                        if cfg.require_known_speaker_for_transcript and transcript:
+                        if cfg.speaker.require_known_speaker_for_transcript and transcript:
                             recognized, speaker_id, probability = await asyncio.to_thread(
                                 speaker_pipeline.recognize_known_speaker,
                                 completed_audio,
@@ -280,7 +280,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                             "producer": "ceo",
                             "ts": frame.time,
                             "transcript": transcript,
-                            "asr_model": cfg.asr_model,
+                            "asr_model": cfg.asr.asr_model,
                         }
                         try:
                             async with cmd_send_lock:
@@ -322,7 +322,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                     if text:
                         queued = enqueue_say_to_user(
                             say_to_user_queue,
-                            SayToUserItem(text=text, retries_left=cfg.say_to_user_max_retries),
+                            SayToUserItem(text=text, retries_left=cfg.outbound.say_to_user_max_retries),
                             overflow_policy=overflow_policy,
                         )
                         if not queued:

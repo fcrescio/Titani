@@ -3,7 +3,12 @@
 from .config import (
     DEFAULT_WEBRTC_SAMPLE_RATE,
     TARGET_SAMPLE_RATE,
+    AsrConfig,
     CeoConfig,
+    DebugConfig,
+    IngressConfig,
+    OutboundConfig,
+    SpeakerConfig,
 )
 from .debug import CeoDebug
 
@@ -18,11 +23,16 @@ except ModuleNotFoundError:  # optional runtime deps for CEO mode
     TtsOutboundAudioTrack = TtsPipeline = None  # type: ignore[assignment]
 
 __all__ = [
+    "AsrConfig",
     "AsrPipeline",
     "CeoConfig",
     "CeoDebug",
+    "DebugConfig",
     "DEFAULT_WEBRTC_SAMPLE_RATE",
+    "IngressConfig",
+    "OutboundConfig",
     "SmartTurnPipeline",
+    "SpeakerConfig",
     "SpeakerEmbeddingPipeline",
     "TARGET_SAMPLE_RATE",
     "TtsOutboundAudioTrack",

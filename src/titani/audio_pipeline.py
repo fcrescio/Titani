@@ -6,8 +6,8 @@ from collections import deque
 from enum import Enum
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
+from typing import Any
 
 import numpy as np
 import webrtcvad
@@ -18,6 +18,7 @@ from av.audio.resampler import AudioResampler
 from titani.ceo_components.audio_utils import resample_pcm16
 from titani.ceo_components.config import (
     DEFAULT_WEBRTC_SAMPLE_RATE,
+    IngressConfig,
     OUTBOUND_HIGH_WATERMARK_MS,
     OUTBOUND_LOW_WATERMARK_MS,
     OUTBOUND_PREBUFFER_CHUNKS,
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 class SmartTurnPipeline:
     """Simple VAD + silence-based turn segmentation for ASR."""
 
-    def __init__(self, cfg: Any, debug: Any | None = None):
+    def __init__(self, cfg: IngressConfig, debug: Any | None = None):
         self._cfg = cfg
         self._debug = debug
         self._vad = webrtcvad.Vad(2)
