@@ -72,6 +72,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_optional_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return int(raw)
+
+
 @dataclass(slots=True)
 class IngressConfig:
     pre_roll_ms: int = int(os.getenv("CEO_PRE_ROLL_MS", "250"))
@@ -164,6 +171,28 @@ class OutboundConfig:
     say_to_user_queue_overflow_policy: str = os.getenv("CEO_SAY_TO_USER_QUEUE_OVERFLOW_POLICY", "drop_oldest")
     say_to_user_max_retries: int = max(0, int(os.getenv("CEO_SAY_TO_USER_MAX_RETRIES", "2")))
     say_to_user_retry_delay_s: float = max(0.0, float(os.getenv("CEO_SAY_TO_USER_RETRY_DELAY_S", "0.1")))
+    adaptive_policy_enabled: bool = _env_bool("CEO_OUTBOUND_ADAPTIVE_POLICY_ENABLED", True)
+    adaptive_start_prebuffer_chunks: int | None = _env_optional_int("CEO_OUTBOUND_ADAPTIVE_START_PREBUFFER_CHUNKS")
+    adaptive_start_max_buffer_ms: int | None = _env_optional_int("CEO_OUTBOUND_ADAPTIVE_START_MAX_BUFFER_MS")
+
+    def __post_init__(self) -> None:
+        self.tts_model = os.getenv("CEO_TTS_MODEL", self.tts_model)
+        self.tts_ref_audio = os.getenv("CEO_TTS_REF_AUDIO", self.tts_ref_audio)
+        self.tts_ref_text = os.getenv("CEO_TTS_REF_TEXT", self.tts_ref_text)
+        self.tts_streaming_interval = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", str(self.tts_streaming_interval)))
+        self.say_to_user_queue_maxsize = max(1, int(os.getenv("CEO_SAY_TO_USER_QUEUE_MAXSIZE", str(self.say_to_user_queue_maxsize))))
+        self.say_to_user_queue_overflow_policy = os.getenv(
+            "CEO_SAY_TO_USER_QUEUE_OVERFLOW_POLICY",
+            self.say_to_user_queue_overflow_policy,
+        )
+        self.say_to_user_max_retries = max(0, int(os.getenv("CEO_SAY_TO_USER_MAX_RETRIES", str(self.say_to_user_max_retries))))
+        self.say_to_user_retry_delay_s = max(
+            0.0,
+            float(os.getenv("CEO_SAY_TO_USER_RETRY_DELAY_S", str(self.say_to_user_retry_delay_s))),
+        )
+        self.adaptive_policy_enabled = _env_bool("CEO_OUTBOUND_ADAPTIVE_POLICY_ENABLED", self.adaptive_policy_enabled)
+        self.adaptive_start_prebuffer_chunks = _env_optional_int("CEO_OUTBOUND_ADAPTIVE_START_PREBUFFER_CHUNKS")
+        self.adaptive_start_max_buffer_ms = _env_optional_int("CEO_OUTBOUND_ADAPTIVE_START_MAX_BUFFER_MS")
 
 
 @dataclass(slots=True)

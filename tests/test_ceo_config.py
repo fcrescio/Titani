@@ -101,5 +101,33 @@ class TestCeoIngressProfiles(unittest.TestCase):
                 CeoConfig()
 
 
+class TestCeoOutboundAdaptivePolicyConfig(unittest.TestCase):
+    def test_adaptive_policy_enabled_defaults_to_true(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = CeoConfig()
+
+        self.assertTrue(cfg.outbound.adaptive_policy_enabled)
+
+    def test_adaptive_policy_can_be_disabled(self) -> None:
+        with patch.dict(os.environ, {"CEO_OUTBOUND_ADAPTIVE_POLICY_ENABLED": "0"}, clear=True):
+            cfg = CeoConfig()
+
+        self.assertFalse(cfg.outbound.adaptive_policy_enabled)
+
+    def test_adaptive_start_values_are_optional(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CEO_OUTBOUND_ADAPTIVE_START_PREBUFFER_CHUNKS": "5",
+                "CEO_OUTBOUND_ADAPTIVE_START_MAX_BUFFER_MS": "240",
+            },
+            clear=True,
+        ):
+            cfg = CeoConfig()
+
+        self.assertEqual(cfg.outbound.adaptive_start_prebuffer_chunks, 5)
+        self.assertEqual(cfg.outbound.adaptive_start_max_buffer_ms, 240)
+
+
 if __name__ == "__main__":
     unittest.main()
