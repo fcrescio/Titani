@@ -15,15 +15,21 @@ WEBRTC_CHUNK_MS = int(os.getenv("CEO_WEBRTC_CHUNK_MS", "20"))
 WEBRTC_CHUNK_SAMPLES = TARGET_SAMPLE_RATE * WEBRTC_CHUNK_MS // 1000
 DEFAULT_WEBRTC_SAMPLE_RATE = 48_000
 OUTBOUND_PREBUFFER_CHUNKS = max(1, int(os.getenv("CEO_OUTBOUND_PREBUFFER_CHUNKS", "3")))
-OUTBOUND_MAX_BUFFER_MS = max(100, int(os.getenv("CEO_OUTBOUND_MAX_BUFFER_MS", "400")))
-OUTBOUND_LOW_WATERMARK_MS = max(
-    WEBRTC_CHUNK_MS,
-    int(os.getenv("CEO_OUTBOUND_LOW_WATERMARK_MS", "160")),
+OUTBOUND_TARGET_BUFFER_MS = max(
+    WEBRTC_CHUNK_MS * 2,
+    int(os.getenv("CEO_OUTBOUND_TARGET_BUFFER_MS", "400")),
 )
-OUTBOUND_HIGH_WATERMARK_MS = max(
-    OUTBOUND_LOW_WATERMARK_MS + WEBRTC_CHUNK_MS,
-    int(os.getenv("CEO_OUTBOUND_HIGH_WATERMARK_MS", os.getenv("CEO_OUTBOUND_MAX_BUFFER_MS", "400"))),
-)
+OUTBOUND_LOW_WATERMARK_RATIO = 0.4
+
+
+def derive_outbound_buffer_watermarks(target_buffer_ms: int) -> tuple[int, int]:
+    high_watermark_ms = max(WEBRTC_CHUNK_MS * 2, int(target_buffer_ms))
+    low_watermark_ms = max(
+        WEBRTC_CHUNK_MS,
+        int(high_watermark_ms * OUTBOUND_LOW_WATERMARK_RATIO),
+    )
+    low_watermark_ms = min(low_watermark_ms, high_watermark_ms - WEBRTC_CHUNK_MS)
+    return low_watermark_ms, high_watermark_ms
 
 UNSUPPORTED_NOOP_ENV_VARS: dict[str, str] = {
     "CEO_TTS_LANGUAGE": "Il backend TTS corrente (mlx_audio.tts) non supporta la selezione lingua in generate().",

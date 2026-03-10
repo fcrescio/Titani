@@ -19,9 +19,9 @@ from titani.ceo_components.audio_utils import resample_pcm16
 from titani.ceo_components.config import (
     DEFAULT_WEBRTC_SAMPLE_RATE,
     IngressConfig,
-    OUTBOUND_HIGH_WATERMARK_MS,
-    OUTBOUND_LOW_WATERMARK_MS,
     OUTBOUND_PREBUFFER_CHUNKS,
+    OUTBOUND_TARGET_BUFFER_MS,
+    derive_outbound_buffer_watermarks,
     TARGET_SAMPLE_RATE,
     WEBRTC_CHUNK_MS,
     WEBRTC_CHUNK_SAMPLES,
@@ -412,11 +412,8 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self._playback_idle = asyncio.Event()
         self._playback_idle.set()
         self._prebuffer_chunks = OUTBOUND_PREBUFFER_CHUNKS
-        self._high_watermark_ms = max(OUTBOUND_HIGH_WATERMARK_MS, WEBRTC_CHUNK_MS)
-        self._low_watermark_ms = min(
-            max(OUTBOUND_LOW_WATERMARK_MS, WEBRTC_CHUNK_MS),
-            self._high_watermark_ms - WEBRTC_CHUNK_MS,
-        )
+        self._target_buffer_ms = max(OUTBOUND_TARGET_BUFFER_MS, WEBRTC_CHUNK_MS * 2)
+        self._low_watermark_ms, self._high_watermark_ms = derive_outbound_buffer_watermarks(self._target_buffer_ms)
         self._min_buffered_chunks_for_playback = self._prebuffer_chunks
         self._buffering = True
         self._consumer_started = asyncio.Event()
@@ -676,9 +673,7 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self,
         *,
         prebuffer_chunks: int | None = None,
-        max_buffer_ms: int | None = None,
-        low_watermark_ms: int | None = None,
-        high_watermark_ms: int | None = None,
+        target_buffer_ms: int | None = None,
         reason: str = "runtime-adaptation",
     ) -> dict[str, int]:
         async with self._pending_lock:
@@ -686,19 +681,15 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
                 self._prebuffer_chunks = max(1, int(prebuffer_chunks))
                 self._min_buffered_chunks_for_playback = self._prebuffer_chunks
 
-            if max_buffer_ms is not None and high_watermark_ms is None:
-                high_watermark_ms = int(max_buffer_ms)
+            if target_buffer_ms is not None:
+                self._target_buffer_ms = max(WEBRTC_CHUNK_MS * 2, int(target_buffer_ms))
 
-            if high_watermark_ms is not None:
-                self._high_watermark_ms = max(WEBRTC_CHUNK_MS * 2, int(high_watermark_ms))
-            if low_watermark_ms is not None:
-                self._low_watermark_ms = max(WEBRTC_CHUNK_MS, int(low_watermark_ms))
-
-            self._low_watermark_ms = min(self._low_watermark_ms, self._high_watermark_ms - WEBRTC_CHUNK_MS)
+            self._low_watermark_ms, self._high_watermark_ms = derive_outbound_buffer_watermarks(self._target_buffer_ms)
 
             snapshot = {
                 "prebuffer_chunks": int(self._prebuffer_chunks),
                 "min_buffered_chunks_for_playback": int(self._min_buffered_chunks_for_playback),
+                "target_buffer_ms": int(self._target_buffer_ms),
                 "max_buffer_ms": int(self._high_watermark_ms),
                 "high_watermark_ms": int(self._high_watermark_ms),
                 "low_watermark_ms": int(self._low_watermark_ms),

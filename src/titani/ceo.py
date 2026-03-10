@@ -142,7 +142,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
         )
         await outbound_track.update_buffer_policy(
             prebuffer_chunks=prebuffer_target,
-            max_buffer_ms=max_buffer_target_ms,
+            target_buffer_ms=max_buffer_target_ms,
             reason="startup-baseline",
         )
 
@@ -200,7 +200,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
 
                 snapshot = await outbound_track.update_buffer_policy(
                     prebuffer_chunks=prebuffer_target,
-                    max_buffer_ms=max_buffer_target_ms,
+                    target_buffer_ms=max_buffer_target_ms,
                     reason=reason,
                 )
 
