@@ -40,8 +40,15 @@ Solo **Teia**:
 
 Solo **Ceo**:
 
-- `CEO_PRE_ROLL_MS` (default: `250`, audio pre-roll in millisecondi incluso all'inizio turno)
+**Parametri minimi per avvio ingresso**
+
 - `CEO_INGRESS_PROFILE` (default: `balanced`, profilo VAD ingress predefinito: `balanced`, `noisy`, `fast`)
+- `CEO_ASR_MODEL` (default: `mlx-community/Qwen3-ASR-0.6B-8bit`)
+- `CEO_ASR_LANGUAGE` (default: `Italian`)
+
+**Parametri avanzati ingresso / debug / outbound**
+
+- `CEO_PRE_ROLL_MS` (default: `250`, audio pre-roll in millisecondi incluso all'inizio turno)
 - `CEO_ADVANCED_TUNING` (default: `false`, abilita override granulari VAD via env dedicati)
 - `CEO_START_SPEECH_CHUNKS` (override *solo* con `CEO_ADVANCED_TUNING=1`, frame consecutivi speech richiesti per avviare un turno)
 - `CEO_SPEECH_MAJORITY_RATIO` (override *solo* con `CEO_ADVANCED_TUNING=1`, quota minima di subchunk speech per considerare un frame parlato)
@@ -52,8 +59,6 @@ Solo **Ceo**:
 - `CEO_TRAILING_SILENCE_PAD_MS` (default: `200`, pad massimo di silenzio finale incluso nel segmento)
 - `CEO_DEBUG_DUMP_WAV_ENABLED` (default: `false`, abilita dump WAV debug dei turni smart-turn committati)
 - `CEO_DEBUG_DUMP_WAV_DIR` (default: `./ceo_debug/smart_turn`, directory dei dump WAV smart-turn)
-- `CEO_ASR_MODEL` (default: `mlx-community/Qwen3-ASR-0.6B-8bit`)
-- `CEO_ASR_LANGUAGE` (default: `Italian`)
 - `CEO_DEBUG_MODE` (default: `false`, abilita heartbeat audio e dump segmenti per debug)
 - `CEO_DEBUG_OUT_DIR` (default: `./ceo_debug`, directory in cui salvare i segmenti `.wav` inviati ad ASR)
 - `CEO_DEBUG_HEARTBEAT_MS` (default: `2000`, frequenza log heartbeat audio in millisecondi)
@@ -65,6 +70,13 @@ Solo **Ceo**:
 - `CEO_TTS_REF_AUDIO` (default: vuoto, path al file `.wav` di riferimento per il voice cloning)
 - `CEO_TTS_REF_TEXT` (default: vuoto, trascrizione del file audio di riferimento)
 - `CEO_TTS_STREAMING_INTERVAL` (default: `0.32`)
+- `CEO_SPEAKER_EMBEDDING_THRESHOLD` (default: `0.8`, soglia similarità per identificazione speaker)
+- `CEO_SPEAKER_EMBEDDINGS_DIR` (default: `./ceo_speakers`, directory embeddings speaker noti)
+- `CEO_REQUIRE_KNOWN_SPEAKER_FOR_TRANSCRIPT` (default: `false`, inoltra trascrizioni solo per speaker riconosciuti)
+- `CEO_SAY_TO_USER_QUEUE_MAXSIZE` (default: `32`, capienza coda messaggi TTS outbound)
+- `CEO_SAY_TO_USER_QUEUE_OVERFLOW_POLICY` (default: `drop_oldest`, policy overflow coda outbound)
+- `CEO_SAY_TO_USER_MAX_RETRIES` (default: `2`, numero retry messaggi outbound in attesa datachannel)
+- `CEO_SAY_TO_USER_RETRY_DELAY_S` (default: `0.1`, delay tra retry outbound)
 
 Profili ingress predefiniti (`CEO_INGRESS_PROFILE`):
 

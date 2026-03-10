@@ -1,6 +1,6 @@
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from titani.common import ErmeteConfig
 
@@ -67,7 +67,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 @dataclass(slots=True)
-class CeoConfig(ErmeteConfig):
+class IngressConfig:
     pre_roll_ms: int = int(os.getenv("CEO_PRE_ROLL_MS", "250"))
     ingress_profile: str = os.getenv("CEO_INGRESS_PROFILE", INGRESS_PROFILE_DEFAULT).strip().lower()
     advanced_tuning: bool = _env_bool("CEO_ADVANCED_TUNING", False)
@@ -81,28 +81,6 @@ class CeoConfig(ErmeteConfig):
     smart_turn_min_segment_seconds: float = float(os.getenv("CEO_SMART_TURN_MIN_SEGMENT_SECONDS", "3.0"))
     debug_dump_wav_enabled: bool = _env_bool("CEO_DEBUG_DUMP_WAV_ENABLED", False)
     debug_dump_wav_dir: str = os.getenv("CEO_DEBUG_DUMP_WAV_DIR", "./ceo_debug/smart_turn")
-    asr_model: str = os.getenv("CEO_ASR_MODEL", "mlx-community/Qwen3-ASR-0.6B-8bit")
-    asr_language: str = os.getenv("CEO_ASR_LANGUAGE", "Italian")
-    debug_mode: bool = _env_bool("CEO_DEBUG_MODE", False)
-    debug_out_dir: str = os.getenv("CEO_DEBUG_OUT_DIR", "./ceo_debug")
-    debug_heartbeat_ms: int = int(os.getenv("CEO_DEBUG_HEARTBEAT_MS", "2000"))
-    debug_vad_trace: bool = _env_bool("CEO_DEBUG_VAD_TRACE", False)
-    debug_vad_trace_every_chunks: int = int(os.getenv("CEO_DEBUG_VAD_TRACE_EVERY_CHUNKS", "25"))
-    debug_vad_trace_jsonl: bool = _env_bool("CEO_DEBUG_VAD_TRACE_JSONL", False)
-    tts_model: str = os.getenv(
-        "CEO_TTS_MODEL",
-        "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
-    )
-    tts_ref_audio: str = os.getenv("CEO_TTS_REF_AUDIO", "")
-    tts_ref_text: str = os.getenv("CEO_TTS_REF_TEXT", "")
-    tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.04"))
-    speaker_embedding_threshold: float = float(os.getenv("CEO_SPEAKER_EMBEDDING_THRESHOLD", "0.8"))
-    speaker_embeddings_dir: str = os.getenv("CEO_SPEAKER_EMBEDDINGS_DIR", "./ceo_speakers")
-    require_known_speaker_for_transcript: bool = _env_bool("CEO_REQUIRE_KNOWN_SPEAKER_FOR_TRANSCRIPT", False)
-    say_to_user_queue_maxsize: int = max(1, int(os.getenv("CEO_SAY_TO_USER_QUEUE_MAXSIZE", "32")))
-    say_to_user_queue_overflow_policy: str = os.getenv("CEO_SAY_TO_USER_QUEUE_OVERFLOW_POLICY", "drop_oldest")
-    say_to_user_max_retries: int = max(0, int(os.getenv("CEO_SAY_TO_USER_MAX_RETRIES", "2")))
-    say_to_user_retry_delay_s: float = max(0.0, float(os.getenv("CEO_SAY_TO_USER_RETRY_DELAY_S", "0.1")))
 
     def __post_init__(self) -> None:
         self.ingress_profile = os.getenv("CEO_INGRESS_PROFILE", INGRESS_PROFILE_DEFAULT).strip().lower()
@@ -153,6 +131,54 @@ class CeoConfig(ErmeteConfig):
                 f"CEO_SPEECH_SUBCHUNK_MIN_COUNT deve essere >= 1, ricevuto: {self.speech_subchunk_min_count!r}."
             )
 
+
+@dataclass(slots=True)
+class AsrConfig:
+    asr_model: str = os.getenv("CEO_ASR_MODEL", "mlx-community/Qwen3-ASR-0.6B-8bit")
+    asr_language: str = os.getenv("CEO_ASR_LANGUAGE", "Italian")
+
+
+@dataclass(slots=True)
+class SpeakerConfig:
+    speaker_embedding_threshold: float = float(os.getenv("CEO_SPEAKER_EMBEDDING_THRESHOLD", "0.8"))
+    speaker_embeddings_dir: str = os.getenv("CEO_SPEAKER_EMBEDDINGS_DIR", "./ceo_speakers")
+    require_known_speaker_for_transcript: bool = _env_bool("CEO_REQUIRE_KNOWN_SPEAKER_FOR_TRANSCRIPT", False)
+
+
+@dataclass(slots=True)
+class OutboundConfig:
+    tts_model: str = os.getenv(
+        "CEO_TTS_MODEL",
+        "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
+    )
+    tts_ref_audio: str = os.getenv("CEO_TTS_REF_AUDIO", "")
+    tts_ref_text: str = os.getenv("CEO_TTS_REF_TEXT", "")
+    tts_streaming_interval: float = float(os.getenv("CEO_TTS_STREAMING_INTERVAL", "0.04"))
+    say_to_user_queue_maxsize: int = max(1, int(os.getenv("CEO_SAY_TO_USER_QUEUE_MAXSIZE", "32")))
+    say_to_user_queue_overflow_policy: str = os.getenv("CEO_SAY_TO_USER_QUEUE_OVERFLOW_POLICY", "drop_oldest")
+    say_to_user_max_retries: int = max(0, int(os.getenv("CEO_SAY_TO_USER_MAX_RETRIES", "2")))
+    say_to_user_retry_delay_s: float = max(0.0, float(os.getenv("CEO_SAY_TO_USER_RETRY_DELAY_S", "0.1")))
+
+
+@dataclass(slots=True)
+class DebugConfig:
+    debug_mode: bool = _env_bool("CEO_DEBUG_MODE", False)
+    debug_out_dir: str = os.getenv("CEO_DEBUG_OUT_DIR", "./ceo_debug")
+    debug_heartbeat_ms: int = int(os.getenv("CEO_DEBUG_HEARTBEAT_MS", "2000"))
+    debug_vad_trace: bool = _env_bool("CEO_DEBUG_VAD_TRACE", False)
+    debug_vad_trace_every_chunks: int = int(os.getenv("CEO_DEBUG_VAD_TRACE_EVERY_CHUNKS", "25"))
+    debug_vad_trace_jsonl: bool = _env_bool("CEO_DEBUG_VAD_TRACE_JSONL", False)
+
+
+@dataclass(slots=True)
+class CeoConfig(ErmeteConfig):
+    ingress: IngressConfig = field(default_factory=IngressConfig)
+    asr: AsrConfig = field(default_factory=AsrConfig)
+    speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
+    outbound: OutboundConfig = field(default_factory=OutboundConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
+
+    def __post_init__(self) -> None:
         for env_name, reason in UNSUPPORTED_NOOP_ENV_VARS.items():
             raw_value = os.getenv(env_name)
             if raw_value is None:

@@ -6,7 +6,7 @@ from mlx_audio.tts.utils import load_model as load_tts
 
 from titani.audio_pipeline import TtsOutboundAudioTrack
 
-from .config import TARGET_SAMPLE_RATE, CeoConfig
+from .config import OutboundConfig, TARGET_SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 class TtsPipeline:
 
-    def __init__(self, cfg: CeoConfig):
+    def __init__(self, cfg: OutboundConfig):
         self._cfg = cfg
         self._model = load_tts(cfg.tts_model)
         self._ref_audio_path = Path(cfg.tts_ref_audio).expanduser() if cfg.tts_ref_audio.strip() else None
