@@ -23,16 +23,6 @@ from titani.say_queue import SayToUserItem, enqueue_say_to_user, handle_say_to_u
 logger = logging.getLogger(__name__)
 
 OUTBOUND_OBS_INTERVAL_S = 1.0
-OUTBOUND_JITTER_HIGH_S = 0.030
-OUTBOUND_RTT_HIGH_S = 0.250
-OUTBOUND_JITTER_STABLE_S = 0.012
-OUTBOUND_RTT_STABLE_S = 0.120
-OUTBOUND_PREBUFFER_MIN_CHUNKS = 1
-OUTBOUND_PREBUFFER_MAX_CHUNKS = 8
-OUTBOUND_MAX_BUFFER_MIN_MS = 60
-OUTBOUND_MAX_BUFFER_MAX_MS = 420
-OUTBOUND_PREBUFFER_STEP_CHUNKS = 1
-OUTBOUND_MAX_BUFFER_STEP_MS = 20
 
 
 def _resolve_outbound_adaptation_start(
@@ -40,21 +30,65 @@ def _resolve_outbound_adaptation_start(
     startup_snapshot: dict[str, int],
     cfg: CeoConfig,
 ) -> tuple[int, int]:
+    adaptation_cfg = cfg.outbound_adaptation
     prebuffer_target = max(
-        OUTBOUND_PREBUFFER_MIN_CHUNKS,
+        adaptation_cfg.prebuffer_min_chunks,
         min(
-            OUTBOUND_PREBUFFER_MAX_CHUNKS,
+            adaptation_cfg.prebuffer_max_chunks,
             int(cfg.outbound.adaptive_start_prebuffer_chunks or startup_snapshot["prebuffer_chunks"]),
         ),
     )
     max_buffer_target_ms = max(
-        OUTBOUND_MAX_BUFFER_MIN_MS,
+        adaptation_cfg.buffer_min_ms,
         min(
-            OUTBOUND_MAX_BUFFER_MAX_MS,
+            adaptation_cfg.buffer_max_ms,
             int(cfg.outbound.adaptive_start_max_buffer_ms or startup_snapshot["max_buffer_ms"]),
         ),
     )
     return prebuffer_target, max_buffer_target_ms
+
+
+def _next_outbound_adaptation_state(
+    *,
+    prebuffer_target: int,
+    max_buffer_target_ms: int,
+    jitter_s: float,
+    round_trip_time_s: float,
+    packets_lost: int,
+    cfg: CeoConfig,
+) -> tuple[int, int, str]:
+    adaptation_cfg = cfg.outbound_adaptation
+    high_jitter = jitter_s >= adaptation_cfg.jitter_high_s
+    high_rtt = round_trip_time_s >= adaptation_cfg.rtt_high_s
+    stable_link = (
+        jitter_s <= adaptation_cfg.stable_jitter_s
+        and round_trip_time_s <= adaptation_cfg.stable_rtt_s
+        and packets_lost == 0
+    )
+
+    reason = "hold"
+    if high_jitter or high_rtt:
+        prebuffer_target = min(
+            adaptation_cfg.prebuffer_max_chunks,
+            prebuffer_target + adaptation_cfg.prebuffer_step_chunks,
+        )
+        max_buffer_target_ms = min(
+            adaptation_cfg.buffer_max_ms,
+            max_buffer_target_ms + adaptation_cfg.buffer_step_ms,
+        )
+        reason = "network-degraded"
+    elif stable_link:
+        prebuffer_target = max(
+            adaptation_cfg.prebuffer_min_chunks,
+            prebuffer_target - adaptation_cfg.prebuffer_step_chunks,
+        )
+        max_buffer_target_ms = max(
+            adaptation_cfg.buffer_min_ms,
+            max_buffer_target_ms - adaptation_cfg.buffer_step_ms,
+        )
+        reason = "network-stable"
+
+    return prebuffer_target, max_buffer_target_ms, reason
 
 
 async def ceo_consumer(cfg: CeoConfig) -> None:
@@ -207,31 +241,14 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                 if bitrate_bps <= 0:
                     bitrate_bps = int(max(0.0, bytes_sent * 8.0 / OUTBOUND_OBS_INTERVAL_S))
 
-                high_jitter = jitter >= OUTBOUND_JITTER_HIGH_S
-                high_rtt = round_trip_time >= OUTBOUND_RTT_HIGH_S
-                stable_link = jitter <= OUTBOUND_JITTER_STABLE_S and round_trip_time <= OUTBOUND_RTT_STABLE_S and packets_lost == 0
-
-                reason = "hold"
-                if high_jitter or high_rtt:
-                    prebuffer_target = min(
-                        OUTBOUND_PREBUFFER_MAX_CHUNKS,
-                        prebuffer_target + OUTBOUND_PREBUFFER_STEP_CHUNKS,
-                    )
-                    max_buffer_target_ms = min(
-                        OUTBOUND_MAX_BUFFER_MAX_MS,
-                        max_buffer_target_ms + OUTBOUND_MAX_BUFFER_STEP_MS,
-                    )
-                    reason = "network-degraded"
-                elif stable_link:
-                    prebuffer_target = max(
-                        OUTBOUND_PREBUFFER_MIN_CHUNKS,
-                        prebuffer_target - OUTBOUND_PREBUFFER_STEP_CHUNKS,
-                    )
-                    max_buffer_target_ms = max(
-                        OUTBOUND_MAX_BUFFER_MIN_MS,
-                        max_buffer_target_ms - OUTBOUND_MAX_BUFFER_STEP_MS,
-                    )
-                    reason = "network-stable"
+                prebuffer_target, max_buffer_target_ms, reason = _next_outbound_adaptation_state(
+                    prebuffer_target=prebuffer_target,
+                    max_buffer_target_ms=max_buffer_target_ms,
+                    jitter_s=jitter,
+                    round_trip_time_s=round_trip_time,
+                    packets_lost=packets_lost,
+                    cfg=cfg,
+                )
 
                 snapshot = await outbound_track.update_buffer_policy(
                     prebuffer_chunks=prebuffer_target,

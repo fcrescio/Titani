@@ -196,6 +196,47 @@ class OutboundConfig:
 
 
 @dataclass(slots=True)
+class OutboundAdaptationConfig:
+    jitter_high_s: float = max(0.0, float(os.getenv("CEO_OUTBOUND_ADAPT_JITTER_HIGH_S", "0.030")))
+    rtt_high_s: float = max(0.0, float(os.getenv("CEO_OUTBOUND_ADAPT_RTT_HIGH_S", "0.250")))
+    prebuffer_max_chunks: int = max(2, int(os.getenv("CEO_OUTBOUND_ADAPT_PREBUFFER_MAX_CHUNKS", "8")))
+    buffer_max_ms: int = max(80, int(os.getenv("CEO_OUTBOUND_ADAPT_BUFFER_MAX_MS", "420")))
+
+    def __post_init__(self) -> None:
+        self.jitter_high_s = max(0.0, float(os.getenv("CEO_OUTBOUND_ADAPT_JITTER_HIGH_S", str(self.jitter_high_s))))
+        self.rtt_high_s = max(0.0, float(os.getenv("CEO_OUTBOUND_ADAPT_RTT_HIGH_S", str(self.rtt_high_s))))
+        self.prebuffer_max_chunks = max(
+            2,
+            int(os.getenv("CEO_OUTBOUND_ADAPT_PREBUFFER_MAX_CHUNKS", str(self.prebuffer_max_chunks))),
+        )
+        self.buffer_max_ms = max(80, int(os.getenv("CEO_OUTBOUND_ADAPT_BUFFER_MAX_MS", str(self.buffer_max_ms))))
+
+    @property
+    def stable_jitter_s(self) -> float:
+        return self.jitter_high_s * 0.4
+
+    @property
+    def stable_rtt_s(self) -> float:
+        return self.rtt_high_s * 0.48
+
+    @property
+    def prebuffer_min_chunks(self) -> int:
+        return 1
+
+    @property
+    def prebuffer_step_chunks(self) -> int:
+        return 1
+
+    @property
+    def buffer_min_ms(self) -> int:
+        return max(60, int(self.buffer_max_ms * 0.15))
+
+    @property
+    def buffer_step_ms(self) -> int:
+        return max(10, int(self.buffer_max_ms * 0.05))
+
+
+@dataclass(slots=True)
 class DebugConfig:
     debug_mode: bool = _env_bool("CEO_DEBUG_MODE", False)
     debug_out_dir: str = os.getenv("CEO_DEBUG_OUT_DIR", "./ceo_debug")
@@ -211,6 +252,7 @@ class CeoConfig(ErmeteConfig):
     asr: AsrConfig = field(default_factory=AsrConfig)
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     outbound: OutboundConfig = field(default_factory=OutboundConfig)
+    outbound_adaptation: OutboundAdaptationConfig = field(default_factory=OutboundAdaptationConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
 
     def __post_init__(self) -> None:

@@ -2,13 +2,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from titani.ceo import (
-    OUTBOUND_MAX_BUFFER_MAX_MS,
-    OUTBOUND_MAX_BUFFER_MIN_MS,
-    OUTBOUND_PREBUFFER_MAX_CHUNKS,
-    OUTBOUND_PREBUFFER_MIN_CHUNKS,
-    _resolve_outbound_adaptation_start,
-)
+from titani.ceo import _next_outbound_adaptation_state, _resolve_outbound_adaptation_start
 from titani.ceo_components.config import CeoConfig
 
 
@@ -60,8 +54,8 @@ class TestCeoOutboundAdaptationStart(unittest.TestCase):
             cfg=cfg,
         )
 
-        self.assertEqual(prebuffer_target, OUTBOUND_PREBUFFER_MAX_CHUNKS)
-        self.assertEqual(max_buffer_target_ms, OUTBOUND_MAX_BUFFER_MAX_MS)
+        self.assertEqual(prebuffer_target, cfg.outbound_adaptation.prebuffer_max_chunks)
+        self.assertEqual(max_buffer_target_ms, cfg.outbound_adaptation.buffer_max_ms)
 
         with patch.dict(
             os.environ,
@@ -78,8 +72,44 @@ class TestCeoOutboundAdaptationStart(unittest.TestCase):
             cfg=cfg,
         )
 
-        self.assertEqual(prebuffer_target, OUTBOUND_PREBUFFER_MIN_CHUNKS)
-        self.assertEqual(max_buffer_target_ms, OUTBOUND_MAX_BUFFER_MIN_MS)
+        self.assertEqual(prebuffer_target, cfg.outbound_adaptation.prebuffer_min_chunks)
+        self.assertEqual(max_buffer_target_ms, cfg.outbound_adaptation.buffer_min_ms)
+
+
+class TestCeoOutboundAdaptationStateTransitions(unittest.TestCase):
+    def test_network_degraded_increases_buffer_targets(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = CeoConfig()
+
+        prebuffer, max_buffer_ms, reason = _next_outbound_adaptation_state(
+            prebuffer_target=3,
+            max_buffer_target_ms=200,
+            jitter_s=cfg.outbound_adaptation.jitter_high_s,
+            round_trip_time_s=0.0,
+            packets_lost=0,
+            cfg=cfg,
+        )
+
+        self.assertEqual(reason, "network-degraded")
+        self.assertEqual(prebuffer, 4)
+        self.assertEqual(max_buffer_ms, 221)
+
+    def test_network_stable_reduces_buffer_targets(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = CeoConfig()
+
+        prebuffer, max_buffer_ms, reason = _next_outbound_adaptation_state(
+            prebuffer_target=4,
+            max_buffer_target_ms=300,
+            jitter_s=cfg.outbound_adaptation.stable_jitter_s,
+            round_trip_time_s=cfg.outbound_adaptation.stable_rtt_s,
+            packets_lost=0,
+            cfg=cfg,
+        )
+
+        self.assertEqual(reason, "network-stable")
+        self.assertEqual(prebuffer, 3)
+        self.assertEqual(max_buffer_ms, 279)
 
 
 if __name__ == "__main__":

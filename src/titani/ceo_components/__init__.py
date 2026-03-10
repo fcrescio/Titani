@@ -7,6 +7,7 @@ from .config import (
     CeoConfig,
     DebugConfig,
     IngressConfig,
+    OutboundAdaptationConfig,
     OutboundConfig,
     SpeakerConfig,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "DebugConfig",
     "DEFAULT_WEBRTC_SAMPLE_RATE",
     "IngressConfig",
+    "OutboundAdaptationConfig",
     "OutboundConfig",
     "SmartTurnPipeline",
     "SpeakerConfig",
