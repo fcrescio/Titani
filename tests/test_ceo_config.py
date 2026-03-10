@@ -27,20 +27,20 @@ class TestCeoIngressProfiles(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             cfg = CeoConfig()
 
-        self.assertEqual(cfg.ingress_profile, "balanced")
-        self.assertEqual(cfg.start_speech_chunks, 10)
-        self.assertEqual(cfg.speech_majority_ratio, 0.5)
-        self.assertEqual(cfg.speech_subchunk_min_count, 2)
-        self.assertEqual(cfg.vad_min_rms, 0.0)
+        self.assertEqual(cfg.ingress.ingress_profile, "balanced")
+        self.assertEqual(cfg.ingress.start_speech_chunks, 10)
+        self.assertEqual(cfg.ingress.speech_majority_ratio, 0.5)
+        self.assertEqual(cfg.ingress.speech_subchunk_min_count, 2)
+        self.assertEqual(cfg.ingress.vad_min_rms, 0.0)
 
     def test_profile_overrides_vad_defaults(self) -> None:
         with patch.dict(os.environ, {"CEO_INGRESS_PROFILE": "noisy"}, clear=True):
             cfg = CeoConfig()
 
-        self.assertEqual(cfg.start_speech_chunks, 12)
-        self.assertEqual(cfg.speech_majority_ratio, 0.65)
-        self.assertEqual(cfg.speech_subchunk_min_count, 3)
-        self.assertEqual(cfg.vad_min_rms, 0.02)
+        self.assertEqual(cfg.ingress.start_speech_chunks, 12)
+        self.assertEqual(cfg.ingress.speech_majority_ratio, 0.65)
+        self.assertEqual(cfg.ingress.speech_subchunk_min_count, 3)
+        self.assertEqual(cfg.ingress.vad_min_rms, 0.02)
 
     def test_manual_overrides_are_ignored_without_advanced_tuning(self) -> None:
         with patch.dict(
@@ -57,10 +57,10 @@ class TestCeoIngressProfiles(unittest.TestCase):
             with self.assertLogs("titani.ceo_components.config", level="WARNING") as captured:
                 cfg = CeoConfig()
 
-        self.assertEqual(cfg.start_speech_chunks, 10)
-        self.assertEqual(cfg.speech_majority_ratio, 0.5)
-        self.assertEqual(cfg.speech_subchunk_min_count, 2)
-        self.assertEqual(cfg.vad_min_rms, 0.0)
+        self.assertEqual(cfg.ingress.start_speech_chunks, 10)
+        self.assertEqual(cfg.ingress.speech_majority_ratio, 0.5)
+        self.assertEqual(cfg.ingress.speech_subchunk_min_count, 2)
+        self.assertEqual(cfg.ingress.vad_min_rms, 0.0)
         self.assertTrue(any("CEO_START_SPEECH_CHUNKS='2' ignorato" in line for line in captured.output))
 
     def test_manual_overrides_are_applied_with_advanced_tuning(self) -> None:
@@ -78,10 +78,10 @@ class TestCeoIngressProfiles(unittest.TestCase):
         ):
             cfg = CeoConfig()
 
-        self.assertEqual(cfg.start_speech_chunks, 7)
-        self.assertEqual(cfg.speech_majority_ratio, 0.55)
-        self.assertEqual(cfg.speech_subchunk_min_count, 3)
-        self.assertEqual(cfg.vad_min_rms, 0.03)
+        self.assertEqual(cfg.ingress.start_speech_chunks, 7)
+        self.assertEqual(cfg.ingress.speech_majority_ratio, 0.55)
+        self.assertEqual(cfg.ingress.speech_subchunk_min_count, 3)
+        self.assertEqual(cfg.ingress.vad_min_rms, 0.03)
 
     def test_rejects_unknown_profile(self) -> None:
         with patch.dict(os.environ, {"CEO_INGRESS_PROFILE": "turbo"}, clear=True):
@@ -127,6 +127,33 @@ class TestCeoOutboundAdaptivePolicyConfig(unittest.TestCase):
 
         self.assertEqual(cfg.outbound.adaptive_start_prebuffer_chunks, 5)
         self.assertEqual(cfg.outbound.adaptive_start_max_buffer_ms, 240)
+
+    def test_outbound_adaptation_section_defaults(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = CeoConfig()
+
+        self.assertEqual(cfg.outbound_adaptation.jitter_high_s, 0.03)
+        self.assertEqual(cfg.outbound_adaptation.rtt_high_s, 0.25)
+        self.assertEqual(cfg.outbound_adaptation.prebuffer_max_chunks, 8)
+        self.assertEqual(cfg.outbound_adaptation.buffer_max_ms, 420)
+
+    def test_outbound_adaptation_section_can_be_overridden(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CEO_OUTBOUND_ADAPT_JITTER_HIGH_S": "0.04",
+                "CEO_OUTBOUND_ADAPT_RTT_HIGH_S": "0.3",
+                "CEO_OUTBOUND_ADAPT_PREBUFFER_MAX_CHUNKS": "10",
+                "CEO_OUTBOUND_ADAPT_BUFFER_MAX_MS": "500",
+            },
+            clear=True,
+        ):
+            cfg = CeoConfig()
+
+        self.assertEqual(cfg.outbound_adaptation.jitter_high_s, 0.04)
+        self.assertEqual(cfg.outbound_adaptation.rtt_high_s, 0.3)
+        self.assertEqual(cfg.outbound_adaptation.prebuffer_max_chunks, 10)
+        self.assertEqual(cfg.outbound_adaptation.buffer_max_ms, 500)
 
 
 if __name__ == "__main__":
