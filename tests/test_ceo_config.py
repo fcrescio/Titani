@@ -22,5 +22,84 @@ class TestCeoConfigNoopEnv(unittest.TestCase):
                 CeoConfig()
 
 
+class TestCeoIngressProfiles(unittest.TestCase):
+    def test_balanced_profile_is_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = CeoConfig()
+
+        self.assertEqual(cfg.ingress_profile, "balanced")
+        self.assertEqual(cfg.start_speech_chunks, 10)
+        self.assertEqual(cfg.speech_majority_ratio, 0.5)
+        self.assertEqual(cfg.speech_subchunk_min_count, 2)
+        self.assertEqual(cfg.vad_min_rms, 0.0)
+
+    def test_profile_overrides_vad_defaults(self) -> None:
+        with patch.dict(os.environ, {"CEO_INGRESS_PROFILE": "noisy"}, clear=True):
+            cfg = CeoConfig()
+
+        self.assertEqual(cfg.start_speech_chunks, 12)
+        self.assertEqual(cfg.speech_majority_ratio, 0.65)
+        self.assertEqual(cfg.speech_subchunk_min_count, 3)
+        self.assertEqual(cfg.vad_min_rms, 0.02)
+
+    def test_manual_overrides_are_ignored_without_advanced_tuning(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CEO_INGRESS_PROFILE": "balanced",
+                "CEO_START_SPEECH_CHUNKS": "2",
+                "CEO_SPEECH_MAJORITY_RATIO": "0.1",
+                "CEO_SPEECH_SUBCHUNK_MIN_COUNT": "1",
+                "CEO_VAD_MIN_RMS": "0.5",
+            },
+            clear=True,
+        ):
+            with self.assertLogs("titani.ceo_components.config", level="WARNING") as captured:
+                cfg = CeoConfig()
+
+        self.assertEqual(cfg.start_speech_chunks, 10)
+        self.assertEqual(cfg.speech_majority_ratio, 0.5)
+        self.assertEqual(cfg.speech_subchunk_min_count, 2)
+        self.assertEqual(cfg.vad_min_rms, 0.0)
+        self.assertTrue(any("CEO_START_SPEECH_CHUNKS='2' ignorato" in line for line in captured.output))
+
+    def test_manual_overrides_are_applied_with_advanced_tuning(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CEO_INGRESS_PROFILE": "balanced",
+                "CEO_ADVANCED_TUNING": "1",
+                "CEO_START_SPEECH_CHUNKS": "7",
+                "CEO_SPEECH_MAJORITY_RATIO": "0.55",
+                "CEO_SPEECH_SUBCHUNK_MIN_COUNT": "3",
+                "CEO_VAD_MIN_RMS": "0.03",
+            },
+            clear=True,
+        ):
+            cfg = CeoConfig()
+
+        self.assertEqual(cfg.start_speech_chunks, 7)
+        self.assertEqual(cfg.speech_majority_ratio, 0.55)
+        self.assertEqual(cfg.speech_subchunk_min_count, 3)
+        self.assertEqual(cfg.vad_min_rms, 0.03)
+
+    def test_rejects_unknown_profile(self) -> None:
+        with patch.dict(os.environ, {"CEO_INGRESS_PROFILE": "turbo"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "CEO_INGRESS_PROFILE"):
+                CeoConfig()
+
+    def test_rejects_out_of_range_majority_ratio(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CEO_ADVANCED_TUNING": "1",
+                "CEO_SPEECH_MAJORITY_RATIO": "1.5",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "CEO_SPEECH_MAJORITY_RATIO"):
+                CeoConfig()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -58,6 +58,13 @@ class SmartTurnPipeline:
         self._audio_resampler = AudioResampler(format="s16", layout="mono", rate=TARGET_SAMPLE_RATE)
         self._pending_input_frames_16k: list[np.ndarray] = []
         self._pending_input_frames_target = 3
+        if cfg.speech_subchunk_min_count > self._pending_input_frames_target:
+            logger.warning(
+                "[ceo][config] speech_subchunk_min_count=%s maggiore dei subchunk nominali per frame=%s; "
+                "durante il runtime verra' clampato al massimo disponibile.",
+                cfg.speech_subchunk_min_count,
+                self._pending_input_frames_target,
+            )
         self._last_vad_stats = {
             "speech_subchunks": 0,
             "total_subchunks": 0,

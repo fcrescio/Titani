@@ -41,10 +41,12 @@ Solo **Teia**:
 Solo **Ceo**:
 
 - `CEO_PRE_ROLL_MS` (default: `250`, audio pre-roll in millisecondi incluso all'inizio turno)
-- `CEO_START_SPEECH_CHUNKS` (default: `10`, frame consecutivi speech richiesti per avviare un turno)
-- `CEO_SPEECH_MAJORITY_RATIO` (default: `0.5`, quota minima di subchunk speech per considerare un frame parlato)
-- `CEO_SPEECH_SUBCHUNK_MIN_COUNT` (default: `2`, minimo assoluto di subchunk speech per frame)
-- `CEO_VAD_MIN_RMS` (default: `0.0`, soglia RMS minima opzionale per ridurre falsi positivi VAD)
+- `CEO_INGRESS_PROFILE` (default: `balanced`, profilo VAD ingress predefinito: `balanced`, `noisy`, `fast`)
+- `CEO_ADVANCED_TUNING` (default: `false`, abilita override granulari VAD via env dedicati)
+- `CEO_START_SPEECH_CHUNKS` (override *solo* con `CEO_ADVANCED_TUNING=1`, frame consecutivi speech richiesti per avviare un turno)
+- `CEO_SPEECH_MAJORITY_RATIO` (override *solo* con `CEO_ADVANCED_TUNING=1`, quota minima di subchunk speech per considerare un frame parlato)
+- `CEO_SPEECH_SUBCHUNK_MIN_COUNT` (override *solo* con `CEO_ADVANCED_TUNING=1`, minimo assoluto di subchunk speech per frame)
+- `CEO_VAD_MIN_RMS` (override *solo* con `CEO_ADVANCED_TUNING=1`, soglia RMS minima opzionale per ridurre falsi positivi VAD)
 - `CEO_SILENCE_MS_BEFORE_ENDPOINT` (default: `300`, millisecondi di silenzio prima di entrare in endpoint candidate)
 - `CEO_MAX_SILENCE_MS_FORCE_COMMIT` (default: `1500`, timeout hard di silenzio continuo per chiudere turno)
 - `CEO_TRAILING_SILENCE_PAD_MS` (default: `200`, pad massimo di silenzio finale incluso nel segmento)
@@ -63,6 +65,16 @@ Solo **Ceo**:
 - `CEO_TTS_REF_AUDIO` (default: vuoto, path al file `.wav` di riferimento per il voice cloning)
 - `CEO_TTS_REF_TEXT` (default: vuoto, trascrizione del file audio di riferimento)
 - `CEO_TTS_STREAMING_INTERVAL` (default: `0.32`)
+
+Profili ingress predefiniti (`CEO_INGRESS_PROFILE`):
+
+| Profilo | `start_speech_chunks` | `speech_majority_ratio` | `speech_subchunk_min_count` | `vad_min_rms` | Trade-off |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `balanced` | 10 | 0.50 | 2 | 0.00 | Compromesso generale tra latenza e robustezza. |
+| `noisy` | 12 | 0.65 | 3 | 0.02 | Più robusto al rumore/falsi positivi, ma con avvio turno più lento. |
+| `fast` | 6 | 0.40 | 1 | 0.00 | Minima latenza di aggancio turno, ma più sensibile a rumore e spike. |
+
+Nota: con `CEO_ADVANCED_TUNING=0` (default) gli override granulari vengono ignorati con warning nei log e prevale sempre il profilo selezionato.
 
 ### Nota migrazione CEO
 
