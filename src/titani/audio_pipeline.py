@@ -18,7 +18,8 @@ from av.audio.resampler import AudioResampler
 from titani.ceo_components.audio_utils import resample_pcm16
 from titani.ceo_components.config import (
     DEFAULT_WEBRTC_SAMPLE_RATE,
-    OUTBOUND_MAX_BUFFER_MS,
+    OUTBOUND_HIGH_WATERMARK_MS,
+    OUTBOUND_LOW_WATERMARK_MS,
     OUTBOUND_PREBUFFER_CHUNKS,
     TARGET_SAMPLE_RATE,
     WEBRTC_CHUNK_MS,
@@ -388,6 +389,8 @@ class _TurnState(Enum):
 class TtsOutboundAudioTrack(MediaStreamTrack):
     kind = "audio"
 
+    _SILENCE_CHUNK_PEAK_THRESHOLD = 96
+
     def __init__(self):
         super().__init__()
         self._queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=256)
@@ -401,10 +404,46 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         self._playback_idle = asyncio.Event()
         self._playback_idle.set()
         self._prebuffer_chunks = OUTBOUND_PREBUFFER_CHUNKS
-        self._max_buffer_ms = OUTBOUND_MAX_BUFFER_MS
+        self._high_watermark_ms = max(OUTBOUND_HIGH_WATERMARK_MS, WEBRTC_CHUNK_MS)
+        self._low_watermark_ms = min(
+            max(OUTBOUND_LOW_WATERMARK_MS, WEBRTC_CHUNK_MS),
+            self._high_watermark_ms - WEBRTC_CHUNK_MS,
+        )
         self._min_buffered_chunks_for_playback = self._prebuffer_chunks
         self._buffering = True
         self._consumer_started = asyncio.Event()
+
+        self.underflow_count = 0
+        self.overflow_count = 0
+        self.dropped_ms = 0.0
+
+        self._last_metrics_log_ts = time.monotonic()
+        self._metrics_log_interval_s = 5.0
+
+    def _watermark_chunks(self) -> tuple[int, int]:
+        low_chunks = max(1, int(self._low_watermark_ms // WEBRTC_CHUNK_MS))
+        high_chunks = max(low_chunks + 1, int(self._high_watermark_ms // WEBRTC_CHUNK_MS))
+        return low_chunks, high_chunks
+
+    @staticmethod
+    def _is_silence_chunk(chunk: np.ndarray) -> bool:
+        if chunk.size == 0:
+            return True
+        return int(np.max(np.abs(chunk))) <= TtsOutboundAudioTrack._SILENCE_CHUNK_PEAK_THRESHOLD
+
+    def _maybe_log_runtime_metrics(self) -> None:
+        now = time.monotonic()
+        if now - self._last_metrics_log_ts < self._metrics_log_interval_s:
+            return
+        self._last_metrics_log_ts = now
+        logger.info(
+            "[ceo][outbound-metrics] underflow_count=%s overflow_count=%s dropped_ms=%.1f pending_chunks=%s queue_size=%s",
+            self.underflow_count,
+            self.overflow_count,
+            self.dropped_ms,
+            self._pending_chunks,
+            self._queue.qsize(),
+        )
 
     def set_output_sample_rate(self, sample_rate: int) -> None:
         if sample_rate <= 0 or sample_rate == self._sample_rate:
@@ -446,11 +485,13 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
                 if self._started_at is None:
                     self._started_at = time.monotonic()
 
+                self.underflow_count += 1
                 frame_to_return = _make_frame(_silence())
                 self._next_pts += chunk_samples
 
                 target_t = self._started_at + (frame_to_return.pts / sample_rate)
                 sleep_s = target_t - time.monotonic()
+                self._maybe_log_runtime_metrics()
 
         if frame_to_return is not None:
             if sleep_s > 0:
@@ -499,9 +540,12 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         async with self._pending_lock:
             if dequeued:
                 self._pending_chunks = max(0, int(self._pending_chunks) - 1)
+            else:
+                self.underflow_count += 1
             if self._queue.qsize() == 0:
                 self._buffering = True
                 self._playback_idle.set()
+            self._maybe_log_runtime_metrics()
 
         return frame
 
@@ -532,21 +576,44 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
 
         dropped_old = 0
         dropped_new = 0
+        trimmed_silence = 0
 
         async with self._pending_lock:
             self._playback_idle.clear()
-            max_buffer_chunks = max(1, self._max_buffer_ms // WEBRTC_CHUNK_MS)
+            low_chunks, high_chunks = self._watermark_chunks()
+
+            if self._pending_chunks > high_chunks:
+                self._min_buffered_chunks_for_playback = max(1, min(self._min_buffered_chunks_for_playback, low_chunks))
+
+            projected_pending = self._pending_chunks + len(chunks)
+            overflow_chunks = max(0, projected_pending - high_chunks)
+
+            if overflow_chunks > 0:
+                trimmed = 0
+                while trimmed < overflow_chunks and chunks and self._is_silence_chunk(chunks[0]):
+                    chunks.pop(0)
+                    trimmed += 1
+                while trimmed < overflow_chunks and chunks and self._is_silence_chunk(chunks[-1]):
+                    chunks.pop()
+                    trimmed += 1
+                trimmed_silence += trimmed
+
+            while self._pending_chunks > high_chunks and self._pending_chunks > low_chunks and not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                    self._pending_chunks = max(0, self._pending_chunks - 1)
+                    dropped_old += 1
+                except asyncio.QueueEmpty:
+                    break
 
             for pcm in chunks:
-                while self._pending_chunks >= max_buffer_chunks and not self._queue.empty():
-                    try:
-                        self._queue.get_nowait()
-                        self._pending_chunks = max(0, self._pending_chunks - 1)
-                        dropped_old += 1
-                    except asyncio.QueueEmpty:
-                        break
+                if self._pending_chunks >= high_chunks:
+                    dropped_new += 1
+                    continue
 
                 while self._queue.full():
+                    if self._pending_chunks <= low_chunks:
+                        break
                     try:
                         self._queue.get_nowait()
                         self._pending_chunks = max(0, self._pending_chunks - 1)
@@ -554,22 +621,35 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
                     except asyncio.QueueEmpty:
                         break
 
-                try:
-                    self._queue.put_nowait(pcm)
-                    self._pending_chunks += 1
-                except asyncio.QueueFull:
+                if self._queue.full():
                     dropped_new += 1
+                    continue
 
+                self._queue.put_nowait(pcm)
+                self._pending_chunks += 1
+
+            dropped_total = dropped_old + dropped_new + trimmed_silence
+            if dropped_total:
+                self.overflow_count += 1
+                self.dropped_ms += dropped_total * WEBRTC_CHUNK_MS
             if self._pending_chunks == 0 and self._queue.qsize() == 0:
                 self._playback_idle.set()
+            self._maybe_log_runtime_metrics()
 
-        if dropped_old or dropped_new:
+        total_in_chunks = len(chunks) + trimmed_silence
+        if dropped_old or dropped_new or trimmed_silence:
+            drop_ratio = (dropped_old + dropped_new) / max(1, total_in_chunks)
             logger.warning(
-                "[ceo] outbound queue under backpressure: dropped_old=%s dropped_new=%s pending=%s",
+                "[ceo] outbound queue backpressure: dropped_old=%s dropped_new=%s trimmed_silence=%s drop_ratio=%.3f pending=%s low_wm_ms=%s high_wm_ms=%s",
                 dropped_old,
                 dropped_new,
+                trimmed_silence,
+                drop_ratio,
                 self._pending_chunks,
+                self._low_watermark_ms,
+                self._high_watermark_ms,
             )
+
 
     async def wait_until_idle(self) -> None:
         await self._playback_idle.wait()
@@ -589,29 +669,42 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
         *,
         prebuffer_chunks: int | None = None,
         max_buffer_ms: int | None = None,
+        low_watermark_ms: int | None = None,
+        high_watermark_ms: int | None = None,
         reason: str = "runtime-adaptation",
     ) -> dict[str, int]:
         async with self._pending_lock:
             if prebuffer_chunks is not None:
                 self._prebuffer_chunks = max(1, int(prebuffer_chunks))
                 self._min_buffered_chunks_for_playback = self._prebuffer_chunks
-            if max_buffer_ms is not None:
-                self._max_buffer_ms = max(WEBRTC_CHUNK_MS, int(max_buffer_ms))
+
+            if max_buffer_ms is not None and high_watermark_ms is None:
+                high_watermark_ms = int(max_buffer_ms)
+
+            if high_watermark_ms is not None:
+                self._high_watermark_ms = max(WEBRTC_CHUNK_MS * 2, int(high_watermark_ms))
+            if low_watermark_ms is not None:
+                self._low_watermark_ms = max(WEBRTC_CHUNK_MS, int(low_watermark_ms))
+
+            self._low_watermark_ms = min(self._low_watermark_ms, self._high_watermark_ms - WEBRTC_CHUNK_MS)
 
             snapshot = {
                 "prebuffer_chunks": int(self._prebuffer_chunks),
                 "min_buffered_chunks_for_playback": int(self._min_buffered_chunks_for_playback),
-                "max_buffer_ms": int(self._max_buffer_ms),
+                "max_buffer_ms": int(self._high_watermark_ms),
+                "high_watermark_ms": int(self._high_watermark_ms),
+                "low_watermark_ms": int(self._low_watermark_ms),
                 "pending_chunks": int(self._pending_chunks),
                 "queue_size": int(self._queue.qsize()),
             }
 
         logger.info(
-            "[ceo][outbound-policy] event=updated reason=%s prebuffer_chunks=%s min_chunks=%s max_buffer_ms=%s pending_chunks=%s queue_size=%s",
+            "[ceo][outbound-policy] event=updated reason=%s prebuffer_chunks=%s min_chunks=%s low_wm_ms=%s high_wm_ms=%s pending_chunks=%s queue_size=%s",
             reason,
             snapshot["prebuffer_chunks"],
             snapshot["min_buffered_chunks_for_playback"],
-            snapshot["max_buffer_ms"],
+            snapshot["low_watermark_ms"],
+            snapshot["high_watermark_ms"],
             snapshot["pending_chunks"],
             snapshot["queue_size"],
         )
