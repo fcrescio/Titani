@@ -35,6 +35,28 @@ OUTBOUND_PREBUFFER_STEP_CHUNKS = 1
 OUTBOUND_MAX_BUFFER_STEP_MS = 20
 
 
+def _resolve_outbound_adaptation_start(
+    *,
+    startup_snapshot: dict[str, int],
+    cfg: CeoConfig,
+) -> tuple[int, int]:
+    prebuffer_target = max(
+        OUTBOUND_PREBUFFER_MIN_CHUNKS,
+        min(
+            OUTBOUND_PREBUFFER_MAX_CHUNKS,
+            int(cfg.outbound.adaptive_start_prebuffer_chunks or startup_snapshot["prebuffer_chunks"]),
+        ),
+    )
+    max_buffer_target_ms = max(
+        OUTBOUND_MAX_BUFFER_MIN_MS,
+        min(
+            OUTBOUND_MAX_BUFFER_MAX_MS,
+            int(cfg.outbound.adaptive_start_max_buffer_ms or startup_snapshot["max_buffer_ms"]),
+        ),
+    )
+    return prebuffer_target, max_buffer_target_ms
+
+
 async def ceo_consumer(cfg: CeoConfig) -> None:
     pc = RTCPeerConnection()
     cmd_channel = WebRTCCommandChannel(pc)
@@ -135,16 +157,29 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     say_to_user_worker_task = asyncio.create_task(say_to_user_worker())
 
     async def adapt_outbound_audio_policy() -> None:
-        prebuffer_target = OUTBOUND_PREBUFFER_MIN_CHUNKS
-        max_buffer_target_ms = max(
-            OUTBOUND_MAX_BUFFER_MIN_MS,
-            min(OUTBOUND_MAX_BUFFER_MAX_MS, OUTBOUND_MAX_BUFFER_MIN_MS + OUTBOUND_MAX_BUFFER_STEP_MS),
+        startup_snapshot = await outbound_track.update_buffer_policy(reason="startup-baseline")
+        prebuffer_target, max_buffer_target_ms = _resolve_outbound_adaptation_start(
+            startup_snapshot=startup_snapshot,
+            cfg=cfg,
         )
-        await outbound_track.update_buffer_policy(
+        snapshot = await outbound_track.update_buffer_policy(
             prebuffer_chunks=prebuffer_target,
             target_buffer_ms=max_buffer_target_ms,
             reason="startup-baseline",
         )
+
+        logger.info(
+            "[ceo][net-adapt] event=startup adaptive_enabled=%s startup_prebuffer_chunks=%s startup_max_buffer_ms=%s initial_prebuffer_chunks=%s initial_max_buffer_ms=%s",
+            cfg.outbound.adaptive_policy_enabled,
+            startup_snapshot["prebuffer_chunks"],
+            startup_snapshot["max_buffer_ms"],
+            snapshot["prebuffer_chunks"],
+            snapshot["max_buffer_ms"],
+        )
+
+        if not cfg.outbound.adaptive_policy_enabled:
+            logger.info("[ceo][net-adapt] event=disabled reason=static-config")
+            return
 
         while True:
             await asyncio.sleep(OUTBOUND_OBS_INTERVAL_S)
@@ -205,7 +240,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                 )
 
                 logger.info(
-                    "[ceo][net-adapt] event=stats reason=%s packets_lost=%s jitter_s=%.4f rtt_s=%.4f bitrate_bps=%s prebuffer_chunks=%s max_buffer_ms=%s",
+                    "[ceo][net-adapt] event=stats reason=%s packets_lost=%s jitter_s=%.4f rtt_s=%.4f bitrate_bps=%s prebuffer_chunks=%s max_buffer_ms=%s base_prebuffer_chunks=%s base_max_buffer_ms=%s",
                     reason,
                     packets_lost,
                     jitter,
@@ -213,6 +248,8 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
                     bitrate_bps,
                     snapshot["prebuffer_chunks"],
                     snapshot["max_buffer_ms"],
+                    startup_snapshot["prebuffer_chunks"],
+                    startup_snapshot["max_buffer_ms"],
                 )
             except asyncio.CancelledError:
                 raise
