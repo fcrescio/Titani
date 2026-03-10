@@ -22,6 +22,17 @@ from titani.say_queue import SayToUserItem, enqueue_say_to_user, handle_say_to_u
 
 logger = logging.getLogger(__name__)
 
+OUTBOUND_OBS_INTERVAL_S = 1.0
+OUTBOUND_JITTER_HIGH_S = 0.030
+OUTBOUND_RTT_HIGH_S = 0.250
+OUTBOUND_JITTER_STABLE_S = 0.012
+OUTBOUND_RTT_STABLE_S = 0.120
+OUTBOUND_PREBUFFER_MIN_CHUNKS = 1
+OUTBOUND_PREBUFFER_MAX_CHUNKS = 8
+OUTBOUND_MAX_BUFFER_MIN_MS = 60
+OUTBOUND_MAX_BUFFER_MAX_MS = 420
+OUTBOUND_PREBUFFER_STEP_CHUNKS = 1
+OUTBOUND_MAX_BUFFER_STEP_MS = 20
 
 
 async def ceo_consumer(cfg: CeoConfig) -> None:
@@ -45,6 +56,7 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
     overflow_policy = (cfg.say_to_user_queue_overflow_policy or "drop_oldest").strip().lower()
     say_to_user_queue: asyncio.Queue[SayToUserItem] = asyncio.Queue(maxsize=cfg.say_to_user_queue_maxsize)
     pump_tasks: set[asyncio.Task[None]] = set()
+    housekeeping_tasks: set[asyncio.Task[None]] = set()
     shutdown_lock = asyncio.Lock()
 
     @pc.on("connectionstatechange")
@@ -122,9 +134,97 @@ async def ceo_consumer(cfg: CeoConfig) -> None:
 
     say_to_user_worker_task = asyncio.create_task(say_to_user_worker())
 
+    async def adapt_outbound_audio_policy() -> None:
+        prebuffer_target = OUTBOUND_PREBUFFER_MIN_CHUNKS
+        max_buffer_target_ms = max(
+            OUTBOUND_MAX_BUFFER_MIN_MS,
+            min(OUTBOUND_MAX_BUFFER_MAX_MS, OUTBOUND_MAX_BUFFER_MIN_MS + OUTBOUND_MAX_BUFFER_STEP_MS),
+        )
+        await outbound_track.update_buffer_policy(
+            prebuffer_chunks=prebuffer_target,
+            max_buffer_ms=max_buffer_target_ms,
+            reason="startup-baseline",
+        )
+
+        while True:
+            await asyncio.sleep(OUTBOUND_OBS_INTERVAL_S)
+            try:
+                stats_report = await pc.getStats()
+                outbound_audio_stats = [
+                    stat
+                    for stat in stats_report.values()
+                    if getattr(stat, "type", "") == "outbound-rtp"
+                    and getattr(stat, "kind", None) == "audio"
+                    and not bool(getattr(stat, "isRemote", False))
+                ]
+
+                if not outbound_audio_stats:
+                    logger.debug("[ceo][net-adapt] event=no-audio-outbound-stats")
+                    continue
+
+                stat = outbound_audio_stats[0]
+                packets_lost = int(getattr(stat, "packetsLost", 0) or 0)
+                jitter = float(getattr(stat, "jitter", 0.0) or 0.0)
+                round_trip_time = float(getattr(stat, "roundTripTime", 0.0) or 0.0)
+                bytes_sent = int(getattr(stat, "bytesSent", 0) or 0)
+                bitrate_bps = int(getattr(stat, "bitrateMean", 0) or 0)
+
+                if bitrate_bps <= 0:
+                    bitrate_bps = int(max(0.0, bytes_sent * 8.0 / OUTBOUND_OBS_INTERVAL_S))
+
+                high_jitter = jitter >= OUTBOUND_JITTER_HIGH_S
+                high_rtt = round_trip_time >= OUTBOUND_RTT_HIGH_S
+                stable_link = jitter <= OUTBOUND_JITTER_STABLE_S and round_trip_time <= OUTBOUND_RTT_STABLE_S and packets_lost == 0
+
+                reason = "hold"
+                if high_jitter or high_rtt:
+                    prebuffer_target = min(
+                        OUTBOUND_PREBUFFER_MAX_CHUNKS,
+                        prebuffer_target + OUTBOUND_PREBUFFER_STEP_CHUNKS,
+                    )
+                    max_buffer_target_ms = min(
+                        OUTBOUND_MAX_BUFFER_MAX_MS,
+                        max_buffer_target_ms + OUTBOUND_MAX_BUFFER_STEP_MS,
+                    )
+                    reason = "network-degraded"
+                elif stable_link:
+                    prebuffer_target = max(
+                        OUTBOUND_PREBUFFER_MIN_CHUNKS,
+                        prebuffer_target - OUTBOUND_PREBUFFER_STEP_CHUNKS,
+                    )
+                    max_buffer_target_ms = max(
+                        OUTBOUND_MAX_BUFFER_MIN_MS,
+                        max_buffer_target_ms - OUTBOUND_MAX_BUFFER_STEP_MS,
+                    )
+                    reason = "network-stable"
+
+                snapshot = await outbound_track.update_buffer_policy(
+                    prebuffer_chunks=prebuffer_target,
+                    max_buffer_ms=max_buffer_target_ms,
+                    reason=reason,
+                )
+
+                logger.info(
+                    "[ceo][net-adapt] event=stats reason=%s packets_lost=%s jitter_s=%.4f rtt_s=%.4f bitrate_bps=%s prebuffer_chunks=%s max_buffer_ms=%s",
+                    reason,
+                    packets_lost,
+                    jitter,
+                    round_trip_time,
+                    bitrate_bps,
+                    snapshot["prebuffer_chunks"],
+                    snapshot["max_buffer_ms"],
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[ceo][net-adapt] event=failed-to-adapt")
+
+    net_adaptation_task = asyncio.create_task(adapt_outbound_audio_policy())
+    housekeeping_tasks.add(net_adaptation_task)
+
     async def shutdown_peer_connection() -> None:
         async with shutdown_lock:
-            tasks = list(pump_tasks)
+            tasks = [*pump_tasks, *housekeeping_tasks]
             for task in tasks:
                 task.cancel()
             for task in tasks:

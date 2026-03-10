@@ -583,3 +583,36 @@ class TtsOutboundAudioTrack(MediaStreamTrack):
             return True
         except asyncio.TimeoutError:
             return False
+
+    async def update_buffer_policy(
+        self,
+        *,
+        prebuffer_chunks: int | None = None,
+        max_buffer_ms: int | None = None,
+        reason: str = "runtime-adaptation",
+    ) -> dict[str, int]:
+        async with self._pending_lock:
+            if prebuffer_chunks is not None:
+                self._prebuffer_chunks = max(1, int(prebuffer_chunks))
+                self._min_buffered_chunks_for_playback = self._prebuffer_chunks
+            if max_buffer_ms is not None:
+                self._max_buffer_ms = max(WEBRTC_CHUNK_MS, int(max_buffer_ms))
+
+            snapshot = {
+                "prebuffer_chunks": int(self._prebuffer_chunks),
+                "min_buffered_chunks_for_playback": int(self._min_buffered_chunks_for_playback),
+                "max_buffer_ms": int(self._max_buffer_ms),
+                "pending_chunks": int(self._pending_chunks),
+                "queue_size": int(self._queue.qsize()),
+            }
+
+        logger.info(
+            "[ceo][outbound-policy] event=updated reason=%s prebuffer_chunks=%s min_chunks=%s max_buffer_ms=%s pending_chunks=%s queue_size=%s",
+            reason,
+            snapshot["prebuffer_chunks"],
+            snapshot["min_buffered_chunks_for_playback"],
+            snapshot["max_buffer_ms"],
+            snapshot["pending_chunks"],
+            snapshot["queue_size"],
+        )
+        return snapshot
